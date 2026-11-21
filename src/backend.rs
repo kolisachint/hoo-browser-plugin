@@ -300,6 +300,11 @@ impl ProfileLock {
 
 /// Try to lock the profile dir: `Ok(Some)` while we hold it, `Ok(None)`
 /// when another live helper holds it (N4: `EWOULDBLOCK`, never stale).
+/// The non-blocking take retries briefly: on a loaded machine the kernel
+/// can report `EWOULDBLOCK` for a lock whose close is still being processed
+/// (observed as flakes under parallel test IO). A live holder keeps its
+/// lock for its whole lifetime, so a short window can never misclassify one
+/// as free — it only absorbs the release race.
 fn try_profile_lock(lock_path: &Path) -> Result<Option<ProfileLock>, HooError> {
     use std::os::unix::io::AsRawFd as _;
     let file = std::fs::OpenOptions::new()
@@ -338,26 +343,137 @@ fn try_profile_lock(lock_path: &Path) -> Result<Option<ProfileLock>, HooError> {
     Ok(Some(lock))
 }
 
+/// What the profile's `SingletonLock` tells us (N1): Chromium writes
+/// `<hostname>-<pid>` there while it runs.
+#[derive(Debug)]
+enum SingletonState {
+    /// No lock file, garbage, or a dead pid: Chromium will take it itself.
+    Free,
+    /// A live process whose command line names our profile dir: a stale
+    /// Chromium from a dead helper. Kill it and take the profile.
+    Stale(libc::pid_t),
+    /// A live process that is not ours: leave the profile alone.
+    Foreign,
+}
+
+/// Command line of `pid`, via /proc (Linux) or `ps` (macOS fallback).
+fn process_cmdline(pid: libc::pid_t) -> Option<String> {
+    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let text = String::from_utf8_lossy(&bytes).replace('\0', " ");
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    // `-ww`: never truncate; the profile path sits at the end of the line.
+    std::process::Command::new("ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        })
+}
+
+fn process_live(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM: a process exists that we may not signal.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn singleton_state(profile: &Path) -> SingletonState {
+    let text = match std::fs::read_to_string(profile.join("SingletonLock")) {
+        Ok(text) => text,
+        Err(_) => return SingletonState::Free,
+    };
+    let Some(pid) = text.trim().rsplit('-').next().and_then(|s| s.parse().ok()) else {
+        return SingletonState::Free;
+    };
+    if !process_live(pid) {
+        return SingletonState::Free;
+    }
+    match process_cmdline(pid) {
+        Some(cmdline) if cmdline.contains(&*profile.to_string_lossy()) => {
+            SingletonState::Stale(pid)
+        }
+        _ => SingletonState::Foreign,
+    }
+}
+
+/// SIGKILL a stale Chromium and its tree (N1). Only uses `killpg` when the
+/// target leads a group that is not ours (M9 group leaders); otherwise a
+/// single `kill`, so we can never signal an unrelated group. Re-checks the
+/// command line first: pids are recycled.
+fn kill_stale_chromium(pid: libc::pid_t, profile: &Path) {
+    let ours = match process_cmdline(pid) {
+        Some(cmdline) if cmdline.contains(&*profile.to_string_lossy()) => true,
+        _ => return,
+    };
+    if !ours {
+        return;
+    }
+    // SAFETY: SIGKILL to a pid re-verified above.
+    unsafe {
+        let pgid = libc::getpgid(pid);
+        if pgid == pid && pgid != libc::getpgrp() {
+            libc::killpg(pid, libc::SIGKILL);
+        } else {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    eprintln!(
+        "hoo-browser: killed stale Chromium {pid} holding {}",
+        profile.display()
+    );
+}
+
+fn runtime_fallback(runtime_dir: &Path, data_dir: &Path) -> (PathBuf, Option<ProfileLock>) {
+    eprintln!(
+        "hoo-browser: profile {} is held by another helper; using a fresh profile in {}",
+        data_dir.display(),
+        runtime_dir.display()
+    );
+    let fresh = runtime_dir.join("profile");
+    let _ = std::fs::remove_dir_all(&fresh);
+    (fresh, None)
+}
+
 /// Pick the Chromium profile: `PLUGIN_DATA/profile` while we hold its
 /// `flock`, else a fresh profile in the per-session runtime dir (C3). A
-/// live holder keeps the data profile and the log line says where this
-/// helper went instead; a dead holder's lock is already gone (N4).
+/// live flock holder keeps the data profile; a stale Chromium that outlived
+/// its helper (flock already gone, `SingletonLock` live) is killed when its
+/// command line names our profile dir, else we fall back too (N1).
 fn select_profile(
     data_dir: &Path,
     runtime_dir: &Path,
 ) -> Result<(PathBuf, Option<ProfileLock>), HooError> {
     let lock_path = data_dir.join("profile.lock");
-    match try_profile_lock(&lock_path)? {
-        Some(lock) => Ok((data_dir.join("profile"), Some(lock))),
-        None => {
-            eprintln!(
-                "hoo-browser: profile {} is held by another helper; using a fresh profile in {}",
-                data_dir.display(),
-                runtime_dir.display()
-            );
-            let fresh = runtime_dir.join("profile");
-            let _ = std::fs::remove_dir_all(&fresh);
-            Ok((fresh, None))
+    let Some(lock) = try_profile_lock(&lock_path)? else {
+        return Ok(runtime_fallback(runtime_dir, data_dir));
+    };
+    let profile = data_dir.join("profile");
+    match singleton_state(&profile) {
+        SingletonState::Free => Ok((profile, Some(lock))),
+        SingletonState::Stale(pid) => {
+            kill_stale_chromium(pid, &profile);
+            Ok((profile, Some(lock)))
+        }
+        SingletonState::Foreign => {
+            drop(lock);
+            Ok(runtime_fallback(runtime_dir, data_dir))
         }
     }
 }
@@ -473,6 +589,11 @@ pub async fn launch_chromium(
             }
         }
     });
+    // Record the browser pid in the lock file for `ps`-level debugging
+    // (N1): authority stays with the open fd, not these bytes.
+    if let Some(lock) = &profile_lock {
+        lock.note_pids(std::process::id(), child.id());
+    }
     Ok(Chromium {
         child,
         endpoint,
@@ -565,6 +686,92 @@ mod tests {
         assert_eq!(profile3, data.join("profile"));
         assert!(lock3.is_some());
         drop(lock3);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn singleton_dead_pid_is_ignored() {
+        let base = std::env::temp_dir().join(format!("hoo-single-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        let runtime = base.join("runtime");
+        std::fs::create_dir_all(&data).unwrap();
+        // A SingletonLock from a dead Chromium never blocks the profile.
+        std::fs::create_dir_all(data.join("profile")).unwrap();
+        std::fs::write(
+            data.join("profile").join("SingletonLock"),
+            "host-2147483647\n",
+        )
+        .unwrap();
+        let (profile, lock) = super::select_profile(&data, &runtime).unwrap();
+        assert_eq!(profile, data.join("profile"));
+        assert!(lock.is_some());
+        // The lock file records pids for debugging.
+        lock.as_ref().unwrap().note_pids(4242, Some(4343));
+        let noted = std::fs::read_to_string(data.join("profile.lock")).unwrap();
+        assert!(noted.contains("helper=4242") && noted.contains("chromium=4343"));
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn singleton_foreign_process_falls_back() {
+        let base = std::env::temp_dir().join(format!("hoo-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        let runtime = base.join("runtime");
+        std::fs::create_dir_all(&data).unwrap();
+        // Our own pid is live but its command line cannot name this profile.
+        let pid = std::process::id();
+        std::fs::create_dir_all(data.join("profile")).unwrap();
+        std::fs::write(
+            data.join("profile").join("SingletonLock"),
+            format!("host-{pid}\n"),
+        )
+        .unwrap();
+        let (profile, lock) = super::select_profile(&data, &runtime).unwrap();
+        assert_eq!(profile, runtime.join("profile"));
+        assert!(lock.is_none());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn singleton_stale_ours_is_killed_and_taken() {
+        let base = std::env::temp_dir().join(format!("hoo-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        let runtime = base.join("runtime");
+        std::fs::create_dir_all(&data).unwrap();
+        let profile = data.join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        // A live sleeper whose command line names our profile: stale ours.
+        // (`exec -a` keeps the marker in argv: plain `sh -c 'sleep 60 #…'`
+        // execs sleep and the comment never reaches the final argv.)
+        let mut sleeper = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("exec -a stale-{} sleep 300", profile.display()),
+            ])
+            .spawn()
+            .expect("sleeper");
+        let pid = sleeper.id();
+        std::fs::write(profile.join("SingletonLock"), format!("host-{pid}\n")).unwrap();
+        let (taken, lock) = super::select_profile(&data, &runtime).unwrap();
+        assert_eq!(taken, profile);
+        assert!(lock.is_some());
+        // The stale process is dead now (best-effort reap).
+        for _ in 0..50 {
+            if sleeper.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            sleeper.try_wait().unwrap().is_some(),
+            "stale sleeper must be killed"
+        );
+        drop(lock);
         let _ = std::fs::remove_dir_all(&base);
     }
 

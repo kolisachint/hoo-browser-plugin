@@ -139,16 +139,25 @@ impl Helper {
             // windowed subprocesses would otherwise survive (M9), keeping
             // the profile locked for the next helper.
             let _ = child.kill().await;
-            if let Some(pid) = child.id() {
-                // SAFETY: killpg on our own child's group only.
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
+            kill_tree(&child);
             let _ = child.wait().await;
         }
         // Dropping the guard closes the fd and releases the flock (N4).
         let _ = self.inner.profile_lock.lock().await.take();
+    }
+
+    /// Fast shutdown for sessionEnding and parent death (N1): kill the
+    /// browser tree FIRST, then close leases with a hard ~1 s cap, then
+    /// reap. hoocode waits ~2 s for us to exit; the 60 s close_all could
+    /// strand us past it. With the browser already dead, the lease closes
+    /// fail fast instead of hanging on a wedged daemon.
+    pub async fn shutdown_fast(&self) {
+        if let Some(child) = self.inner.chromium.lock().await.as_ref() {
+            kill_tree(child);
+        }
+        self.close_all_capped(std::time::Duration::from_secs(1))
+            .await;
+        self.shutdown().await;
     }
 
     /// The agent record for a bearer token, if known.
@@ -867,6 +876,11 @@ impl Helper {
     /// sessionEnding and parent death must not strand windows on the shared
     /// browser. Best effort with an overall cap; the process exits next.
     pub async fn close_all_sessions(&self) {
+        self.close_all_capped(std::time::Duration::from_secs(60))
+            .await;
+    }
+
+    async fn close_all_capped(&self, cap: std::time::Duration) {
         let sessions: Vec<String> = self
             .inner
             .state
@@ -886,7 +900,28 @@ impl Helper {
                 this.close_session(&session).await;
             });
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), set.join_all()).await;
+        let _ = tokio::time::timeout(cap, set.join_all()).await;
+    }
+}
+
+/// SIGKILL a child and its tree, but only via `killpg` when the child leads
+/// a group that is not ours (M9 sets that up for Chromium). A child that
+/// shares our group (tests, plain spawns) gets a single `kill`: killpg on
+/// a foreign pgid could hit an unrelated group.
+fn kill_tree(child: &tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+    let pid = pid as libc::pid_t;
+    // SAFETY: SIGKILL to our own child only.
+    unsafe {
+        let pgid = libc::getpgid(pid);
+        if pgid == pid && pgid != libc::getpgrp() {
+            if libc::killpg(pid, libc::SIGKILL) == 0 {
+                return;
+            }
+        }
+        let _ = libc::kill(pid, libc::SIGKILL);
     }
 }
 
@@ -1001,8 +1036,7 @@ impl ServerHandler for Helper {
                 if sender.agent_id != "root" {
                     return;
                 }
-                self.close_all_sessions().await;
-                self.shutdown().await;
+                self.shutdown_fast().await;
                 std::process::exit(0);
             }
             _ => {}
