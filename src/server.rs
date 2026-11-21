@@ -445,7 +445,73 @@ fn internal(message: String) -> ErrorData {
     ErrorData::new(rmcp::model::ErrorCode::INTERNAL_ERROR, message, None)
 }
 
+/// Tool arg `tab`: 1-based, default 1. Non-integers, floats, zero and
+/// negatives are refused instead of silently defaulting (L2): resolving the
+/// wrong tab would address another lease's session.
+fn tab_of(args: &Value) -> Result<usize, HooError> {
+    match args.get("tab") {
+        None => Ok(1),
+        Some(Value::Number(n)) if n.as_u64().is_some_and(|v| v >= 1) => {
+            Ok(n.as_u64().expect("checked") as usize)
+        }
+        _ => Err(HooError::Failed("tab must be an integer >= 1".into())),
+    }
+}
+
 impl Helper {
+    /// Argv for a lease-scoped agent-browser call (H2: always pinned).
+    fn session_argv(&self, session: &str, command: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            self.inner.agent_browser.to_string_lossy().into_owned(),
+            "--cdp".into(),
+            self.inner.cdp.clone(),
+            "--session".into(),
+            session.into(),
+            "--json".into(),
+            "--pin-tab".into(),
+        ];
+        argv.extend(command.iter().map(|s| (*s).to_owned()));
+        argv
+    }
+
+    /// Resolve the caller's tab to a session with its own window (H2): the
+    /// first call on a new tab runs `window new`; if that fails the lease is
+    /// rolled back so no phantom tab survives; concurrent first calls on a
+    /// new tab wait for the creator instead of opening duplicate windows.
+    async fn acquire(&self, agent_id: &str, tab: usize) -> Result<String, HooError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (session, fresh) = self.inner.state.lock().await.ensure(agent_id, tab)?;
+            if fresh {
+                match self.open_window(&session).await {
+                    Ok(()) => {
+                        self.inner.state.lock().await.mark_ready(&session);
+                        return Ok(session);
+                    }
+                    Err(e) => {
+                        self.inner.state.lock().await.abandon(&session);
+                        return Err(e);
+                    }
+                }
+            }
+            match self.inner.state.lock().await.is_initializing(&session) {
+                // Another call is opening this tab right now: wait for it.
+                Some(true) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(HooError::Failed(format!(
+                            "tab {tab} is still opening; try again"
+                        )));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                // Ready: run on it. Gone (rolled back under us): loop and
+                // re-ensure, which recreates the lease.
+                Some(false) => return Ok(session),
+                None => continue,
+            }
+        }
+    }
+
     /// Run one tool call for `agent`: resolve the lease, run agent-browser,
     /// log overhead. agent-browser failures come back as tool errors (isError),
     /// so the model sees them; refusals are protocol errors.
@@ -461,11 +527,8 @@ impl Helper {
         if tool == "browser_tabs" {
             return self.run_tabs(agent, args).await;
         }
-        let tab = args.get("tab").and_then(Value::as_u64).unwrap_or(1) as usize;
-        let (session, fresh) = self.inner.state.lock().await.ensure(&agent.agent_id, tab)?;
-        if fresh {
-            self.open_window(&session).await?;
-        }
+        let tab = tab_of(args)?;
+        let session = self.acquire(&agent.agent_id, tab).await?;
         let started = std::time::Instant::now();
         let (child, output) = if tool == "browser_screenshot" {
             self.run_screenshot(&session, args).await
@@ -532,14 +595,8 @@ impl Helper {
                     .ok_or_else(|| HooError::Refused("browser_cli args must be strings".into()))
             })
             .collect::<Result<_, _>>()?;
-        let (default_session, owned, fresh) = {
-            let mut state = self.inner.state.lock().await;
-            let (session, fresh) = state.ensure(&agent.agent_id, 1)?;
-            (session, state.owned(&agent.agent_id), fresh)
-        };
-        if fresh {
-            self.open_window(&default_session).await?;
-        }
+        let default_session = self.acquire(&agent.agent_id, 1).await?;
+        let owned = self.inner.state.lock().await.owned(&agent.agent_id);
         let scoped = exec::scope_cli_args(&raw, &self.inner.cdp, &default_session, &owned)?;
         let mut full = vec![self.inner.agent_browser.to_string_lossy().into_owned()];
         full.extend(scoped);
@@ -569,16 +626,7 @@ impl Helper {
 
     /// Give a fresh lease its own window on the shared browser.
     async fn open_window(&self, session: &str) -> Result<(), HooError> {
-        let argv = vec![
-            self.inner.agent_browser.to_string_lossy().into_owned(),
-            "--cdp".into(),
-            self.inner.cdp.clone(),
-            "--session".into(),
-            session.into(),
-            "--json".into(),
-            "window".into(),
-            "new".into(),
-        ];
+        let argv = self.session_argv(session, &["window", "new"]);
         exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await?;
         Ok(())
     }
@@ -682,13 +730,17 @@ impl Helper {
                 Ok(Value::Array(tabs))
             }
             "close" => {
-                let tab = args.get("tab").and_then(Value::as_u64).unwrap_or(1) as usize;
+                let tab = tab_of(args)?;
                 let session = self
                     .inner
                     .state
                     .lock()
                     .await
                     .resolve(&agent.agent_id, tab)?;
+                // The lease's window/tab goes first (H4, best effort),
+                // then `close`, whose failure the caller sees.
+                let tab_close = self.session_argv(&session, &["tab", "close"]);
+                let _ = exec::run_command(&tab_close, CALL_TIMEOUT, &self.inner.sock_dir).await;
                 let argv = exec::tool_argv(
                     &self.inner.agent_browser,
                     &self.inner.cdp,
@@ -747,17 +799,42 @@ impl Helper {
     }
 
     /// Close one agent-browser session, best effort (sweeper/agentEnded).
+    ///
+    /// `window` has no close verb upstream, so the lease's window/tab goes
+    /// first (`tab close` drops the session's tabs on the shared browser),
+    /// then `close` ends the session itself (H4). Either step failing leaves
+    /// the shared browser untouched for the other leases.
     async fn close_session(&self, session: &str) {
-        let argv = vec![
-            self.inner.agent_browser.to_string_lossy().into_owned(),
-            "--cdp".into(),
-            self.inner.cdp.clone(),
-            "--session".into(),
-            session.into(),
-            "--json".into(),
-            "close".into(),
-        ];
-        let _ = exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await;
+        let tab_close = self.session_argv(session, &["tab", "close"]);
+        let _ = exec::run_command(&tab_close, CALL_TIMEOUT, &self.inner.sock_dir).await;
+        let close = self.session_argv(session, &["close"]);
+        let _ = exec::run_command(&close, CALL_TIMEOUT, &self.inner.sock_dir).await;
+    }
+
+    /// Close every lease (bounded concurrency) before killing Chromium (H3):
+    /// sessionEnding and parent death must not strand windows on the shared
+    /// browser. Best effort with an overall cap; the process exits next.
+    pub async fn close_all_sessions(&self) {
+        let sessions: Vec<String> = self
+            .inner
+            .state
+            .lock()
+            .await
+            .leases
+            .keys()
+            .cloned()
+            .collect();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let mut set = tokio::task::JoinSet::new();
+        for session in sessions {
+            let this = self.clone();
+            let semaphore = semaphore.clone();
+            set.spawn(async move {
+                let _permit = semaphore.acquire_owned().await;
+                this.close_session(&session).await;
+            });
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), set.join_all()).await;
     }
 }
 
@@ -854,12 +931,25 @@ impl ServerHandler for Helper {
                 let Some(agent_id) = params.get("agentId").and_then(Value::as_str) else {
                     return;
                 };
+                // Only an agent strictly below the sender (or root) may be
+                // ended: a sibling ending another agent would steal its
+                // leases (H1). Anything else is ignored.
+                if sender.agent_id != "root"
+                    && !agent_id.starts_with(&format!("{}/", sender.agent_id))
+                {
+                    return;
+                }
                 let sessions = self.inner.state.lock().await.remove_agent(agent_id);
                 for session in sessions {
                     self.close_session(&session).await;
                 }
             }
             "hoocode/sessionEnding" => {
+                // Only root ends the session: anyone else's notice is noise.
+                if sender.agent_id != "root" {
+                    return;
+                }
+                self.close_all_sessions().await;
                 self.shutdown().await;
                 std::process::exit(0);
             }

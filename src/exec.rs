@@ -60,6 +60,8 @@ pub fn tool_argv(
     args: &Value,
     shot_path: Option<&Path>,
 ) -> Result<Vec<String>, HooError> {
+    // Background leases: pinned tabs never take focus (upstream AB-1),
+    // so every lease carries --pin-tab (H2).
     let mut argv = vec![
         agent_browser.to_string_lossy().into_owned(),
         "--cdp".into(),
@@ -67,6 +69,7 @@ pub fn tool_argv(
         "--session".into(),
         session.into(),
         "--json".into(),
+        "--pin-tab".into(),
     ];
     let str_arg = |name: &str| args.get(name).and_then(Value::as_str).map(str::to_owned);
     let bool_arg = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
@@ -649,21 +652,22 @@ mod tests {
 
     fn tail(tool: &str, args: Value) -> Vec<String> {
         let full = argv(tool, args);
-        full[6..].to_vec()
+        full[7..].to_vec()
     }
 
     #[test]
     fn globals_come_first() {
         let full = argv("browser_snapshot", json!({}));
         assert_eq!(
-            &full[..6],
+            &full[..7],
             &[
                 "/bin/agent-browser",
                 "--cdp",
                 "ws://e",
                 "--session",
                 "root-1",
-                "--json"
+                "--json",
+                "--pin-tab"
             ]
         );
     }
@@ -748,7 +752,7 @@ mod tests {
             Some(&path),
         )
         .unwrap();
-        assert_eq!(&full[6..], &["screenshot", "/tmp/shot-1.png"]);
+        assert_eq!(&full[7..], &["screenshot", "/tmp/shot-1.png"]);
         let full = tool_argv(
             Path::new("ab"),
             "e",
@@ -758,7 +762,7 @@ mod tests {
             Some(&path),
         )
         .unwrap();
-        assert_eq!(&full[6..], &["screenshot", "--full", "/tmp/shot-1.png"]);
+        assert_eq!(&full[7..], &["screenshot", "--full", "/tmp/shot-1.png"]);
         assert!(tool_argv(
             Path::new("ab"),
             "e",
@@ -892,9 +896,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(&full[6..8], &["eval", "-b"]);
+        assert_eq!(&full[7..9], &["eval", "-b"]);
         assert_eq!(
-            full[8],
+            full[9],
             base64::engine::general_purpose::STANDARD.encode("-1 + -2")
         );
     }

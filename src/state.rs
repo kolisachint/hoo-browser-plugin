@@ -34,6 +34,10 @@ pub struct Lease {
     /// Owning agent id. `adopt` moves this to `root` without renaming.
     pub owner: String,
     pub last_used: Instant,
+    /// Fresh leases stay initializing until `window new` gives them their
+    /// own window (H2): concurrent first calls on a new tab wait on this
+    /// instead of opening duplicate windows.
+    pub initializing: bool,
 }
 
 /// Tokens plus leases. Guarded by one mutex in the app state.
@@ -274,6 +278,7 @@ impl State {
                 session: session.clone(),
                 owner: agent_id.to_owned(),
                 last_used: Instant::now(),
+                initializing: true,
             },
         );
         let slots = self.order.entry(agent_id.to_owned()).or_default();
@@ -314,6 +319,38 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// Mark a fresh lease ready after its window opened (H2).
+    pub fn mark_ready(&mut self, session: &str) {
+        if let Some(lease) = self.leases.get_mut(session) {
+            lease.initializing = false;
+            lease.last_used = Instant::now();
+        }
+    }
+
+    /// True while a fresh lease still waits for its window; `None` when the
+    /// lease is gone (rolled back under the waiter: re-ensure recreates it).
+    pub fn is_initializing(&self, session: &str) -> Option<bool> {
+        self.leases.get(session).map(|lease| lease.initializing)
+    }
+
+    /// Drop a lease that never became ready (H2 rollback after a failed
+    /// `window new`): frees its slot without any permission check, since
+    /// only the creator that just made it ever calls this.
+    pub fn abandon(&mut self, session: &str) {
+        self.leases.remove(session);
+        self.clear_slot(session);
+    }
+
+    fn clear_slot(&mut self, session: &str) {
+        for slots in self.order.values_mut() {
+            for slot in slots.iter_mut() {
+                if *slot == Some(session.to_owned()) {
+                    *slot = None;
+                }
+            }
+        }
     }
 
     /// Sessions idle longer than the limit, for the sweeper.

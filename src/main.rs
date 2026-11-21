@@ -137,14 +137,16 @@ async fn run() -> Result<(), HooError> {
     );
     helper.set_chromium(chromium.child).await;
 
-    // The helper dies with its parent (spec B2): kill Chromium explicitly
-    // first (`process::exit` skips destructors, so `kill_on_drop` would not
-    // fire). The supervisor additionally relies on kill_on_drop.
+    // The helper dies with its parent (spec B2): close every lease first
+    // so no windows strand on the shared browser, then kill Chromium
+    // explicitly (`process::exit` skips destructors, so `kill_on_drop`
+    // would not fire).
     let watcher = helper.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if !parent_alive(parent_pid) {
+                watcher.close_all_sessions().await;
                 watcher.shutdown().await;
                 std::process::exit(0);
             }
