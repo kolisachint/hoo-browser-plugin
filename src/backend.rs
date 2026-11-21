@@ -569,7 +569,7 @@ pub async fn launch_chromium(
     ensure_dir_0700(&profile)?;
     let mut cmd = tokio::process::Command::new(chrome);
     // The browser inherits nothing secret or overriding (L1).
-    crate::exec::child_env(&mut cmd, None);
+    crate::exec::child_env(&mut cmd, None, None);
     // Its own process group: `killpg` in shutdown takes the whole tree.
     {
         use std::os::unix::process::CommandExt as _;

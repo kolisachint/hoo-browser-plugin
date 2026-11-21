@@ -40,6 +40,10 @@ async fn start_helper(agent_browser: &Path, data_dir: &Path) -> (Helper, PathBuf
 /// a fake DevTools listener so they can observe which targets a close
 /// removes.
 async fn start_helper_cdp(agent_browser: &Path, data_dir: &Path, cdp: &str) -> (Helper, PathBuf) {
+    // B6: the helper-owned config is created once at startup (0600),
+    // like main.rs does; spawns only read the cached path.
+    let sock_dir = hoo_browser::backend::socket_dir(data_dir);
+    hoo_browser::exec::ensure_agent_browser_config(&sock_dir).expect("helper config");
     let socket = data_dir.join("helper.sock");
     let helper = Helper::new(
         agent_browser.to_owned(),
@@ -1607,14 +1611,19 @@ async fn real_no_steal_suite() {
     let chromium = hoo_browser::backend::launch_chromium(&chrome, &dir, &dir, false)
         .await
         .expect("launch chromium");
+    let sock_dir = hoo_browser::backend::socket_dir(&dir);
+    hoo_browser::exec::ensure_agent_browser_config(&sock_dir).expect("helper config");
     let helper = Helper::new(
-        agent_browser,
+        agent_browser.clone(),
         chromium.endpoint.clone(),
         dir.clone(),
-        hoo_browser::backend::socket_dir(&dir),
+        sock_dir,
         ROOT_TOKEN.into(),
         "root".into(),
     );
+    // B3: the real suite runs in scoped mode only when forced
+    // (HOO_BROWSER_AB_SCOPED=1); otherwise the upstream binary probes safe.
+    helper.set_scoped(hoo_browser::backend::probe_ab_scoped(&agent_browser).await);
     let socket = dir.join("helper.sock");
     let _ = std::fs::remove_file(&socket);
     tokio::spawn(hoo_browser::server::serve(helper.clone(), socket.clone()));

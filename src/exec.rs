@@ -59,7 +59,11 @@ pub const IDLE_TIMEOUT_MS: &str = "600000";
 /// and agent tokens stay in the helper, and every `AGENT_BROWSER_*` var is
 /// dropped except the ones the helper sets itself (socket isolation, the
 /// idle timeout below, and the helper-owned config from N6).
-pub fn child_env(cmd: &mut tokio::process::Command, sock_dir: Option<&std::path::Path>) {
+pub fn child_env(
+    cmd: &mut tokio::process::Command,
+    sock_dir: Option<&std::path::Path>,
+    agent_browser_config: Option<&std::path::Path>,
+) {
     for (key, _) in std::env::vars() {
         if key == "HOOCODE_HELPER_TOKEN"
             || key == "HOOCODE_AGENT_TOKEN"
@@ -71,13 +75,13 @@ pub fn child_env(cmd: &mut tokio::process::Command, sock_dir: Option<&std::path:
     cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", IDLE_TIMEOUT_MS);
     if let Some(dir) = sock_dir {
         cmd.env("AGENT_BROWSER_SOCKET_DIR", dir);
-        // N6: point every child at the helper-owned config so the user's
-        // `~/.agent-browser/config.json` cannot change helper output
-        // (e.g. screenshotFormat). Re-ensured here (best effort) so direct
-        // `Helper` users get it too; startup creates it fatally.
-        if let Ok(path) = ensure_agent_browser_config(dir) {
-            cmd.env("AGENT_BROWSER_CONFIG", path);
-        }
+    }
+    // N6/B6: point every child at the helper-owned config so the user's
+    // `~/.agent-browser/config.json` cannot change helper output
+    // (e.g. screenshotFormat). The path is cached in the helper state
+    // and created once at startup — spawning never stats or chmods.
+    if let Some(path) = agent_browser_config {
+        cmd.env("AGENT_BROWSER_CONFIG", path);
     }
 }
 
@@ -710,6 +714,7 @@ pub async fn run_command(
     argv: &[String],
     timeout: Duration,
     sock_dir: &Path,
+    agent_browser_config: &Path,
 ) -> Result<Value, HooError> {
     let (program, args) = argv
         .split_first()
@@ -721,7 +726,7 @@ pub async fn run_command(
         // Timing out drops the future; without this the child keeps
         // running orphaned. Scrubbed env: no tokens leak (L1).
         .kill_on_drop(true);
-    child_env(&mut child, Some(sock_dir));
+    child_env(&mut child, Some(sock_dir), Some(agent_browser_config));
     let output = tokio::time::timeout(timeout, child.output())
         .await
         .map_err(|_| {
@@ -930,9 +935,14 @@ mod tests {
             1,
             r#"{"success":false,"data":null,"error":"Failed to connect: refused (os error 61)"}"#,
         );
-        let error = run_command(&[cli.to_string_lossy().into_owned()], timeout, &dir)
-            .await
-            .expect_err("connect failure must error");
+        let error = run_command(
+            &[cli.to_string_lossy().into_owned()],
+            timeout,
+            &dir,
+            &dir.join("cfg.json"),
+        )
+        .await
+        .expect_err("connect failure must error");
         assert!(
             matches!(error, HooError::NotSent(_)),
             "connect failure must be NotSent, got {error:?}"
@@ -944,9 +954,14 @@ mod tests {
             1,
             r#"{"success":false,"data":null,"error":"Failed to connect to CDP at ws://x: refused"}"#,
         );
-        let error = run_command(&[cli.to_string_lossy().into_owned()], timeout, &dir)
-            .await
-            .expect_err("cdp failure must error");
+        let error = run_command(
+            &[cli.to_string_lossy().into_owned()],
+            timeout,
+            &dir,
+            &dir.join("cfg.json"),
+        )
+        .await
+        .expect_err("cdp failure must error");
         assert!(
             matches!(error, HooError::Failed(_)),
             "cdp failure must be Failed, got {error:?}"
@@ -959,9 +974,14 @@ mod tests {
             0,
             r#"{"success":false,"data":null,"error":"Failed to connect: simulated page error"}"#,
         );
-        let error = run_command(&[cli.to_string_lossy().into_owned()], timeout, &dir)
-            .await
-            .expect_err("page failure must error");
+        let error = run_command(
+            &[cli.to_string_lossy().into_owned()],
+            timeout,
+            &dir,
+            &dir.join("cfg.json"),
+        )
+        .await
+        .expect_err("page failure must error");
         assert!(
             matches!(error, HooError::Failed(_)),
             "page failure must be Failed, got {error:?}"

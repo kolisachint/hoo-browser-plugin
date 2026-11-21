@@ -105,6 +105,9 @@ pub struct Inner {
     /// only the bound target recorded at window open. Set once at
     /// startup; tests set it directly. Defaults to safe.
     pub ab_scoped: AtomicBool,
+    /// Cached path of the helper-owned `AGENT_BROWSER_CONFIG` (B6:
+    /// created once at startup, never stat+chmod per spawn).
+    pub agent_browser_config: PathBuf,
 }
 
 impl Helper {
@@ -119,6 +122,7 @@ impl Helper {
         let mut state = State::default();
         state.register_root(root_token, root_agent);
         let log_path = data_dir.join("hoo-browser.log");
+        let agent_browser_config = exec::agent_browser_config_path(&sock_dir);
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
@@ -131,6 +135,7 @@ impl Helper {
                 profile_lock: Mutex::new(None),
                 socket_path: Mutex::new(None),
                 ab_scoped: AtomicBool::new(false),
+                agent_browser_config,
             }),
         }
     }
@@ -570,9 +575,22 @@ impl Helper {
         argv: &[String],
         deadline: std::time::Instant,
     ) -> Result<Value, HooError> {
-        match exec::run_command(argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir).await {
+        match exec::run_command(
+            argv,
+            exec::spawn_timeout(deadline)?,
+            &self.inner.sock_dir,
+            &self.inner.agent_browser_config,
+        )
+        .await
+        {
             Err(HooError::NotSent(_)) => {
-                exec::run_command(argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir).await
+                exec::run_command(
+                    argv,
+                    exec::spawn_timeout(deadline)?,
+                    &self.inner.sock_dir,
+                    &self.inner.agent_browser_config,
+                )
+                .await
             }
             other => other,
         }
@@ -891,7 +909,11 @@ impl Helper {
             .args(args)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        exec::child_env(&mut child, Some(&self.inner.sock_dir));
+        exec::child_env(
+            &mut child,
+            Some(&self.inner.sock_dir),
+            Some(&self.inner.agent_browser_config),
+        );
         let output = tokio::time::timeout(timeout, child.output())
             .await
             .map_err(|_| {
@@ -1085,7 +1107,14 @@ impl Helper {
     async fn close_lease_targets(&self, session: &str) {
         let list = self.session_argv(session, &["tab", "list"]);
         let timeout = exec::call_timeout().min(std::time::Duration::from_secs(15));
-        let Ok(data) = exec::run_command(&list, timeout, &self.inner.sock_dir).await else {
+        let Ok(data) = exec::run_command(
+            &list,
+            timeout,
+            &self.inner.sock_dir,
+            &self.inner.agent_browser_config,
+        )
+        .await
+        else {
             return;
         };
         let targets: Vec<String> = if self.is_scoped() {
@@ -1125,7 +1154,13 @@ impl Helper {
         // session itself. All best effort: the process exits.
         self.close_lease_targets(session).await;
         let close = self.session_argv(session, &["close"]);
-        let _ = exec::run_command(&close, exec::call_timeout(), &self.inner.sock_dir).await;
+        let _ = exec::run_command(
+            &close,
+            exec::call_timeout(),
+            &self.inner.sock_dir,
+            &self.inner.agent_browser_config,
+        )
+        .await;
     }
 }
 
