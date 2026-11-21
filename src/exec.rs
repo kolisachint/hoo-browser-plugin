@@ -225,9 +225,11 @@ pub fn tool_argv(
 
 /// Commands the CLI fallback may run. Everything else is refused: the
 /// helper owns the browser, the sessions, and the daemon, so session
-/// management (`session`, `state`, `tab` switching, `close --all`),
-/// provisioning (`connect`, `install`, `upgrade`, `dashboard`) and state
-/// files stay out of reach.
+/// management (`session`, `state`, `tab` switching, `close`), provisioning
+/// (`connect`, `install`, `upgrade`, `dashboard`), window management
+/// (`window new`) and state files stay out of reach. Closing and windowing
+/// go through the tools (`browser_tabs close`, tab leases), never the CLI:
+/// a CLI `close` would desync the lease the helper still tracks.
 const ALLOWED_CLI_COMMANDS: &[&str] = &[
     "open",
     "goto",
@@ -252,8 +254,6 @@ const ALLOWED_CLI_COMMANDS: &[&str] = &[
     "eval",
     "get",
     "tab",
-    "window",
-    "close",
 ];
 
 /// Global flags agent-browser strips anywhere on the command line, mirrored
@@ -388,9 +388,9 @@ fn allowed_cli_flag(command: &str, flag: &str) -> Option<bool> {
             _ => None,
         },
         // open/goto/navigate/back/forward/reload/fill/select/hover/focus/
-        // check/uncheck/press/key/get/tab/window/close take no flags
-        // upstream (scan_single / parse_selector / positional-only arms
-        // reject them), so none are allowed here either.
+        // check/uncheck/press/key/get/tab take no flags upstream
+        // (scan_single / parse_selector / positional-only arms reject them),
+        // so none are allowed here either.
         _ => None,
     }
 }
@@ -534,20 +534,6 @@ fn check_command_rest(command: &str, first_positional: Option<&str>) -> Result<(
             "browser_cli: only `tab list` is allowed (use browser_tabs to close)".into(),
         ));
     }
-    // `window` only builds new windows; keep it that way.
-    if command == "window" && first_positional != Some("new") {
-        return Err(HooError::Refused(
-            "browser_cli: only `window new` is allowed".into(),
-        ));
-    }
-    // `close --all` would close every agent's sessions; a bare `close`
-    // only ends the caller's own lease. (Dash-tokens never reach here as
-    // positionals; this stays as defence in depth.)
-    if command == "close" && first_positional.is_some_and(|s| s.starts_with('-')) {
-        return Err(HooError::Refused(
-            "browser_cli: `close --all` is not allowed (use browser_tabs close)".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -568,6 +554,8 @@ fn disallowed_hint(command: &str) -> &'static str {
     match command {
         "session" => "sessions are managed by the helper",
         "state" => "state files are managed by the helper",
+        "close" => "close your sessions with browser_tabs close",
+        "window" => "windows are managed by the helper (one per tab lease)",
         "connect" | "install" | "upgrade" | "dashboard" | "doctor" | "profiles" => {
             "browser provisioning is managed by the helper"
         }
@@ -1127,9 +1115,11 @@ mod tests {
             vec!["install"],
             vec!["upgrade"],
             vec!["dashboard"],
+            vec!["close"],
             vec!["close", "--all"],
             vec!["tab", "t2"],
             vec!["tab", "new"],
+            vec!["window", "new"],
             vec!["window", "close"],
             vec!["get", "cdp-url"],
             vec!["batch"],
@@ -1146,8 +1136,6 @@ mod tests {
             vec!["eval", "document.title"],
             vec!["get", "url"],
             vec!["tab", "list"],
-            vec!["window", "new"],
-            vec!["close"],
             vec!["screenshot", "--full", "/tmp/shot.png"],
         ] {
             assert!(scope(&raw).is_ok(), "{raw:?} must pass");
