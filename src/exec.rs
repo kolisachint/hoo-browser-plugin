@@ -155,31 +155,161 @@ pub fn tool_argv(
     Ok(argv)
 }
 
-/// Scope raw CLI-fallback args to the caller's own sessions (spec B2): a
+/// Commands the CLI fallback may run. Everything else is refused: the
+/// helper owns the browser, the sessions, and the daemon, so session
+/// management (`session`, `state`, `tab` switching, `close --all`),
+/// provisioning (`connect`, `install`, `upgrade`, `dashboard`) and state
+/// files stay out of reach.
+const ALLOWED_CLI_COMMANDS: &[&str] = &[
+    "open",
+    "goto",
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "click",
+    "dblclick",
+    "fill",
+    "type",
+    "select",
+    "check",
+    "uncheck",
+    "hover",
+    "focus",
+    "press",
+    "key",
+    "snapshot",
+    "screenshot",
+    "wait",
+    "eval",
+    "get",
+    "tab",
+    "window",
+    "close",
+];
+
+/// Global flags agent-browser strips anywhere on the command line, mirrored
+/// from its `cli/src/flags.rs` (`GLOBAL_FLAGS_WITH_VALUE`; `--session` and
+/// `--cdp` get tailored errors below). The helper manages the browser, so
+/// every one of these is refused wherever it appears before `--`.
+const REFUSED_VALUE_GLOBALS: &[&str] = &[
+    "--session",
+    "--restore-save",
+    "--restore-check-url",
+    "--restore-check-fn",
+    "--namespace",
+    "--headers",
+    "--executable-path",
+    "--cdp",
+    "--cdp-headers",
+    "--extension",
+    "--init-script",
+    "--enable",
+    "--profile",
+    "--state",
+    "--proxy",
+    "--proxy-bypass",
+    "--args",
+    "--user-agent",
+    "-p",
+    "--provider",
+    "--device",
+    "--session-name",
+    "--color-scheme",
+    "--download-path",
+    "--max-output",
+    "--allowed-domains",
+    "--capture",
+    "--action-policy",
+    "--confirm-actions",
+    "--config",
+    "--engine",
+    "--input-mode",
+    "--screenshot-dir",
+    "--screenshot-quality",
+    "--screenshot-format",
+    "--idle-timeout",
+    "--ca-cert",
+    "--model",
+];
+
+/// Mirrored from agent-browser's `cli/src/flags.rs` (`GLOBAL_BOOL_FLAGS`,
+/// minus `--json`, which only changes output shape and stays allowed).
+/// `--restore` is stripped by the CLI even though it is not in that list,
+/// and `--help`/`--version` never reach a browser; all refused here.
+const REFUSED_BOOL_GLOBALS: &[&str] = &[
+    "--headed",
+    "--webgpu",
+    "--no-webmcp",
+    "--debug",
+    "--ignore-https-errors",
+    "--allow-file-access",
+    "--hide-scrollbars",
+    "--auto-connect",
+    "--no-auto-connect",
+    "--pin-tab",
+    "--no-pin-tab",
+    "--no-ca-cert",
+    "--use-system-ca",
+    "--annotate",
+    "--content-boundaries",
+    "--confirm-interactive",
+    "--no-auto-dialog",
+    "--relaunch",
+    "-v",
+    "--verbose",
+    "-q",
+    "--quiet",
+    "--offline",
+    "--quick",
+    "--fix",
+    "--restore",
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+];
+
+/// True for a global flag the helper refuses (both spellings).
+fn is_refused_global(arg: &str) -> bool {
+    let name = arg.split('=').next().unwrap_or(arg);
+    REFUSED_VALUE_GLOBALS.contains(&name) || REFUSED_BOOL_GLOBALS.contains(&name)
+}
+
+/// Scope raw CLI-fallback args to the caller's own sessions (spec B2): only
+/// allow-listed commands run, and only inside the caller's own leases. A
 /// `--session` naming another agent's session is refused; without one, the
 /// caller's default lease is injected; `--cdp` is always the helper's (the
-/// shared browser is not optional). Only leading flags are scanned, matching
-/// the CLI's own global-flag position.
+/// shared browser is not optional). Every global flag is refused anywhere
+/// before `--` — leading or trailing — so `--profile`/`--config`/
+/// `--executable-path` smuggled after the command cannot escape the shared
+/// browser. Past `--`, args are literal data and pass through untouched,
+/// matching agent-browser's own parser.
 pub fn scope_cli_args(
     raw: &[String],
     cdp: &str,
     default_session: &str,
     owned: &[String],
 ) -> Result<Vec<String>, HooError> {
+    // Split at the first `--`: everything past it is literal data.
+    let end_of_options = raw.iter().position(|a| a == "--").unwrap_or(raw.len());
+    let (head, tail) = raw.split_at(end_of_options);
+
+    // Leading globals: `--json` passes, `--session` is checked, anything
+    // else starting with `-` is refused before the command is even known.
     let mut out: Vec<String> = Vec::with_capacity(raw.len() + 4);
     let mut i = 0;
     let mut saw_session = false;
-    let mut saw_cdp = false;
-    while i < raw.len() {
-        let arg = &raw[i];
-        if !arg.starts_with("--") || arg == "--" {
-            break;
-        }
-        if arg == "--session" {
-            let value = raw
+    while i < head.len() {
+        let arg = &head[i];
+        if arg == "--json" {
+            out.push(arg.clone());
+            i += 1;
+        } else if arg == "--session" {
+            let value = head
                 .get(i + 1)
                 .cloned()
-                .ok_or_else(|| HooError::Failed("browser_cli: --session needs a value".into()))?;
+                .ok_or_else(|| HooError::Refused("browser_cli: --session needs a value".into()))?;
             check_session(&value, owned)?;
             saw_session = true;
             out.push(arg.clone());
@@ -190,35 +320,128 @@ pub fn scope_cli_args(
             saw_session = true;
             out.push(arg.clone());
             i += 1;
-        } else if arg == "--cdp" || arg.starts_with("--cdp=") {
-            saw_cdp = true;
-            // Replaced below with the helper's endpoint.
-            if arg == "--cdp" {
-                i += 2;
-            } else {
-                i += 1;
-            }
+        } else if arg.starts_with('-') {
+            return Err(refused_global(arg));
         } else {
-            out.push(arg.clone());
-            // Flags with values pass through untouched (only --session/--cdp
-            // are interpreted).
-            i += 1;
+            break;
         }
     }
-    if saw_cdp {
-        return Err(HooError::Refused(
-            "browser_cli: --cdp is managed by the helper (the shared browser is not optional)"
-                .into(),
-        ));
+    let command = head.get(i).cloned().ok_or_else(|| {
+        HooError::Refused("browser_cli: no command (usage: browser_cli {args: [...]})".into())
+    })?;
+    if !ALLOWED_CLI_COMMANDS.contains(&command.as_str()) {
+        return Err(HooError::Refused(format!(
+            "browser_cli: {command:?} is not allowed ({})",
+            disallowed_hint(&command)
+        )));
     }
-    let mut scoped = vec!["--cdp".to_owned(), cdp.to_owned()];
+    let rest = &head[i + 1..];
+    check_command_rest(&command, rest)?;
+    // Trailing globals: refused even here, since agent-browser strips them
+    // anywhere on the line. Command values that happen to start with `-`
+    // must go past `--` (e.g. `fill e3 -- -x`).
+    let mut rest_iter = rest.iter().peekable();
+    while let Some(arg) = rest_iter.next() {
+        if arg == "--state" && command == "wait" {
+            // `wait <selector> --state <visible|hidden|...>` is wait's own
+            // element-state flag, not the global session-settings flag —
+            // but only with one of its four values.
+            match rest_iter.peek() {
+                Some(value)
+                    if ["visible", "hidden", "attached", "detached"].contains(&value.as_str()) =>
+                {
+                    rest_iter.next();
+                }
+                _ => {
+                    return Err(HooError::Refused(
+                        "browser_cli: --state outside `wait <selector> --state <visible|hidden|attached|detached>` is managed by the helper".into(),
+                    ));
+                }
+            }
+            continue;
+        }
+        if arg.starts_with('-') && is_refused_global(arg) {
+            return Err(refused_global(arg));
+        }
+    }
+
+    let mut scoped = vec!["--cdp".to_owned(), cdp.to_owned(), "--pin-tab".to_owned()];
     if !saw_session {
         scoped.push("--session".to_owned());
         scoped.push(default_session.to_owned());
     }
     scoped.extend(out);
-    scoped.extend(raw[i..].iter().cloned());
+    scoped.push(command);
+    scoped.extend(rest.iter().cloned());
+    scoped.extend(tail.iter().cloned());
     Ok(scoped)
+}
+
+/// Per-command restrictions inside the caller's own session.
+fn check_command_rest(command: &str, rest: &[String]) -> Result<(), HooError> {
+    match command {
+        // `get cdp-url` leaks the shared endpoint; the rest reads the page.
+        "get" => {
+            if rest.first().is_some_and(|s| s == "cdp-url") {
+                return Err(HooError::Refused(
+                    "browser_cli: `get cdp-url` is not allowed (the shared browser is not optional)"
+                        .into(),
+                ));
+            }
+        }
+        // `tab <id>` would switch to another tab and `tab new/close` manage
+        // tabs around the helper; only listing stays.
+        "tab" => {
+            if rest.first().is_some_and(|s| s != "list") {
+                return Err(HooError::Refused(
+                    "browser_cli: only `tab list` is allowed (use browser_tabs to close)".into(),
+                ));
+            }
+        }
+        // `window` only builds new windows; keep it that way.
+        "window" => {
+            if !rest.first().is_some_and(|s| s == "new") {
+                return Err(HooError::Refused(
+                    "browser_cli: only `window new` is allowed".into(),
+                ));
+            }
+        }
+        // `close --all` would close every agent's sessions; a bare `close`
+        // only ends the caller's own lease.
+        "close" => {
+            if rest.iter().any(|a| a.starts_with('-')) {
+                return Err(HooError::Refused(
+                    "browser_cli: `close --all` is not allowed (use browser_tabs close)".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn refused_global(arg: &str) -> HooError {
+    let name = arg.split('=').next().unwrap_or(arg);
+    if name == "--cdp" {
+        return HooError::Refused(
+            "browser_cli: --cdp is managed by the helper (the shared browser is not optional)"
+                .into(),
+        );
+    }
+    HooError::Refused(format!(
+        "browser_cli: global flag {name:?} is managed by the helper"
+    ))
+}
+
+fn disallowed_hint(command: &str) -> &'static str {
+    match command {
+        "session" => "sessions are managed by the helper",
+        "state" => "state files are managed by the helper",
+        "connect" | "install" | "upgrade" | "dashboard" | "doctor" | "profiles" => {
+            "browser provisioning is managed by the helper"
+        }
+        _ => "not in the browser_cli allow-list",
+    }
 }
 
 fn check_session(value: &str, owned: &[String]) -> Result<(), HooError> {
@@ -544,14 +767,14 @@ mod tests {
     #[test]
     fn cli_scoping_refuses_foreign_sessions() {
         let owned = vec!["root_task-1-1".to_owned()];
-        // No --session: the default lease is injected, --cdp first.
+        // No --session: the default lease is injected, --cdp/--pin-tab first.
         let scoped =
             scope_cli_args(&["snapshot".to_owned()], "ws://e", "root_task-1-1", &owned).unwrap();
         assert_eq!(
-            &scoped[..4],
-            &["--cdp", "ws://e", "--session", "root_task-1-1"]
+            &scoped[..5],
+            &["--cdp", "ws://e", "--pin-tab", "--session", "root_task-1-1"]
         );
-        assert_eq!(scoped[4], "snapshot");
+        assert_eq!(scoped[5], "snapshot");
         // Own session passes through.
         let scoped = scope_cli_args(
             &[
@@ -596,5 +819,82 @@ mod tests {
             &owned,
         )
         .is_err());
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn cli_scoping_refuses_every_global_anywhere() {
+        let owned = vec!["root_task-1-1".to_owned()];
+        let scope = |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned);
+        // Trailing globals are refused, not just leading ones.
+        for raw in [
+            vec!["snapshot", "--session", "root-99"],
+            vec!["snapshot", "--session=root-99"],
+            vec!["snapshot", "--cdp", "ws://evil"],
+            vec!["snapshot", "--cdp=ws://evil"],
+            vec!["snapshot", "--config", "/tmp/evil.json"],
+            vec!["snapshot", "--profile", "/tmp/p"],
+            vec!["snapshot", "--executable-path", "/tmp/evil-chrome"],
+            vec!["snapshot", "--auto-connect", "false"],
+            vec!["open", "https://x.example/", "--provider", "chrome"],
+            vec!["snapshot", "--namespace", "other"],
+            vec!["snapshot", "--args", "--no-sandbox"],
+            vec!["snapshot", "--extension", "/tmp/evil"],
+            vec!["snapshot", "--restore", "last"],
+            vec!["wait", "e1", "--state", "/tmp/evil.json"],
+        ] {
+            assert!(scope(&raw).is_err(), "{raw:?} must be refused");
+        }
+        // `--state` is wait's own element-state flag: allowed there.
+        assert!(scope(&["wait", "e1", "--state", "visible"]).is_ok());
+        // Past `--`, tokens are literal data, matching agent-browser.
+        let scoped = scope(&["fill", "e1", "--", "--session", "root-99"]).unwrap();
+        assert!(scoped.contains(&"--".to_owned()));
+        // --json stays allowed (output shape only), anywhere.
+        assert!(scope(&["--json", "snapshot"]).is_ok());
+        assert!(scope(&["snapshot", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn cli_scoping_is_an_allow_list() {
+        let owned = vec!["root_task-1-1".to_owned()];
+        let scope = |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned);
+        // Session management, provisioning, and state files are out.
+        for raw in [
+            vec!["session", "list"],
+            vec!["state", "clear", "--all"],
+            vec!["state", "list"],
+            vec!["connect", "http://127.0.0.1:9999"],
+            vec!["install"],
+            vec!["upgrade"],
+            vec!["dashboard"],
+            vec!["close", "--all"],
+            vec!["tab", "t2"],
+            vec!["tab", "new"],
+            vec!["window", "close"],
+            vec!["get", "cdp-url"],
+            vec!["batch"],
+        ] {
+            assert!(scope(&raw).is_err(), "{raw:?} must be refused");
+        }
+        // The in-session long tail stays usable.
+        for raw in [
+            vec!["open", "https://x.example/"],
+            vec!["snapshot", "--interactive"],
+            vec!["click", "e3"],
+            vec!["fill", "e3", "hello"],
+            vec!["wait", "--text", "done"],
+            vec!["eval", "document.title"],
+            vec!["get", "url"],
+            vec!["tab", "list"],
+            vec!["window", "new"],
+            vec!["close"],
+            vec!["screenshot", "--full", "/tmp/shot.png"],
+        ] {
+            assert!(scope(&raw).is_ok(), "{raw:?} must pass");
+        }
     }
 }
