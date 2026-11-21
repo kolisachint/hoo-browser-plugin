@@ -1342,6 +1342,7 @@ async fn real_no_steal_suite() {
 fn report_overheads(dir: &Path) {
     let text = std::fs::read_to_string(dir.join("hoo-browser.log")).unwrap_or_default();
     let mut overheads: Vec<u128> = Vec::new();
+    let mut windows: Vec<u128> = Vec::new();
     let mut children: Vec<u128> = Vec::new();
     let mut totals: Vec<u128> = Vec::new();
     for line in text.lines() {
@@ -1349,6 +1350,13 @@ fn report_overheads(dir: &Path) {
             if let Some(us) = value.get("overhead_us").and_then(Value::as_u64) {
                 overheads.push(us as u128);
             }
+            // Lines from before the window-new split have no such field.
+            windows.push(
+                value
+                    .get("window_new_us")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u128,
+            );
             if let Some(us) = value.get("child_us").and_then(Value::as_u64) {
                 children.push(us as u128);
             }
@@ -1362,15 +1370,18 @@ fn report_overheads(dir: &Path) {
         return;
     }
     overheads.sort_unstable();
+    windows.sort_unstable();
     children.sort_unstable();
     totals.sort_unstable();
     let pick = |v: &[u128], p: f64| v[((v.len() as f64 * p) as usize).min(v.len() - 1)];
     println!(
-        "calls={} helper-only overhead_us p50={} p95={} max={} | spawn+connect child_us p50={} p95={} | total_us p50={} p95={} (see scripts/overhead.py)",
+        "calls={} helper-only overhead_us p50={} p95={} max={} | window-new window_new_us p50={} p95={} | spawn+connect child_us p50={} p95={} | total_us p50={} p95={} (see scripts/overhead.py)",
         overheads.len(),
         pick(&overheads, 0.5),
         pick(&overheads, 0.95),
         overheads.last().unwrap(),
+        pick(&windows, 0.5),
+        pick(&windows, 0.95),
         pick(&children, 0.5),
         pick(&children, 0.95),
         pick(&totals, 0.5),

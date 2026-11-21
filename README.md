@@ -60,8 +60,8 @@ hoo-browser --session root_task-1-1 eval "document.title"
 ```
 
 Per-call overhead lines go to `<data dir>/hoo-browser.log` (debug level;
-never tokens); `scripts/overhead.py` prints helper-only vs spawn+connect
-p50/p95 from that log. Backend selection: `HOO_BROWSER_BACKEND`
+never tokens); `scripts/overhead.py` prints helper-only vs window-new vs
+spawn+connect p50/p95 from that log. Backend selection: `HOO_BROWSER_BACKEND`
 (`chromium-headless` default, `chromium-headed`; `chrome` and `lightpanda`
 return "not yet supported", B4) or `HOO_BROWSER_HEADED=1`.
 

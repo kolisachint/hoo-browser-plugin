@@ -399,6 +399,12 @@ fn unauthorized_response() -> Response<BoxBody<Bytes, Infallible>> {
 
 /// The rmcp service behind an HTTP-401 bearer check. rmcp has no auth layer
 /// of its own, so unknown tokens are rejected here, before rmcp sees them.
+///
+/// Request-entry stamp (M5): recorded here so the overhead window covers
+/// auth + decode, not just the tool body.
+#[derive(Clone, Copy)]
+struct RequestStarted(std::time::Instant);
+
 #[derive(Clone)]
 struct AuthService<S> {
     helper: Helper,
@@ -424,6 +430,12 @@ where
         let inner = self.inner.clone();
         let helper = self.helper.clone();
         Box::pin(async move {
+            // M5: stamp at request entry, before auth and the rmcp decode.
+            let (mut parts, body) = request.into_parts();
+            parts
+                .extensions
+                .insert(RequestStarted(std::time::Instant::now()));
+            let request = Request::from_parts(parts, body);
             if !is_authorized(&request, &helper).await {
                 return Ok(unauthorized_response());
             }
@@ -513,7 +525,7 @@ impl Helper {
         token: &str,
         tab: usize,
         deadline: std::time::Instant,
-    ) -> Result<String, HooError> {
+    ) -> Result<(String, std::time::Duration), HooError> {
         let agent_id = agent.agent_id.as_str();
         loop {
             // N5: agentEnded may have removed the caller's token while a
@@ -537,13 +549,16 @@ impl Helper {
                 return Err(HooError::Failed(format!("tab {tab} is closing; try again")));
             }
             if fresh {
+                // The window-new wall time is reported separately (M5).
+                let window_started = std::time::Instant::now();
                 match self
                     .open_window(&session, exec::spawn_timeout(deadline)?)
                     .await
                 {
                     Ok(()) => {
+                        let window_new = window_started.elapsed();
                         self.inner.state.lock().await.mark_ready(&session);
-                        return Ok(session);
+                        return Ok((session, window_new));
                     }
                     Err(e) => {
                         self.inner.state.lock().await.abandon(&session);
@@ -561,9 +576,10 @@ impl Helper {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                // Ready: run on it. Gone (rolled back under us): loop and
-                // re-ensure, which recreates the lease.
-                Some(false) => return Ok(session),
+                // Ready: run on it (no window ran on this call). Gone
+                // (rolled back under us): loop and re-ensure, which
+                // recreates the lease (after the N5 token re-check).
+                Some(false) => return Ok((session, std::time::Duration::ZERO)),
                 None => continue,
             }
         }
@@ -576,23 +592,23 @@ impl Helper {
         &self,
         agent: &AgentRecord,
         token: &str,
+        started: std::time::Instant,
         tool: &str,
         args: &Value,
     ) -> Result<Vec<ContentBlock>, HooError> {
         if tool == "browser_cli" {
-            return self.run_cli(agent, token, args).await;
+            return self.run_cli(agent, token, started, args).await;
         }
         if tool == "browser_tabs" {
-            return self.run_tabs(agent, args).await;
+            return self.run_tabs(agent, started, args).await;
         }
-        // Time from request entry (M5): lease acquisition counts as helper
-        // overhead, not child time.
-        let started = std::time::Instant::now();
         // One budget for the whole call (M1): acquire-wait, window new and
-        // the command share it instead of stacking timeouts.
+        // the command share it instead of stacking timeouts. `started` is
+        // the auth-layer entry stamp (M5): the total covers the whole call
+        // while `child` covers only agent-browser spawns.
         let deadline = started + exec::CALL_BUDGET;
         let tab = tab_of(args)?;
-        let session = self.acquire(agent, token, tab, deadline).await?;
+        let (session, window_new) = self.acquire(agent, token, tab, deadline).await?;
         let (child, output) = if tool == "browser_screenshot" {
             self.run_screenshot(&session, args, deadline).await
         } else {
@@ -624,6 +640,7 @@ impl Helper {
                 session: &session,
                 total,
                 child,
+                window_new,
                 ok: error.is_none(),
                 error: error.as_deref(),
             },
@@ -646,9 +663,9 @@ impl Helper {
         &self,
         agent: &AgentRecord,
         token: &str,
+        started: std::time::Instant,
         args: &Value,
     ) -> Result<Vec<ContentBlock>, HooError> {
-        let started = std::time::Instant::now();
         let raw = args
             .get("args")
             .and_then(Value::as_array)
@@ -662,7 +679,7 @@ impl Helper {
             })
             .collect::<Result<_, _>>()?;
         let deadline = started + exec::CALL_BUDGET;
-        let default_session = self.acquire(agent, token, 1, deadline).await?;
+        let (default_session, window_new) = self.acquire(agent, token, 1, deadline).await?;
         let owned = self.inner.state.lock().await.owned(&agent.agent_id);
         let scoped = exec::scope_cli_args(&raw, &self.inner.cdp, &default_session, &owned)?;
         let mut full = vec![self.inner.agent_browser.to_string_lossy().into_owned()];
@@ -683,6 +700,7 @@ impl Helper {
                 session: &default_session,
                 total,
                 child,
+                window_new,
                 ok: error.is_none(),
                 error: error.as_deref(),
             },
@@ -778,10 +796,10 @@ impl Helper {
     async fn run_tabs(
         &self,
         agent: &AgentRecord,
+        started: std::time::Instant,
         args: &Value,
     ) -> Result<Vec<ContentBlock>, HooError> {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
-        let started = std::time::Instant::now();
         let deadline = started + exec::CALL_BUDGET;
         // Child (spawn+connect) time is measured per call, never equated
         // with the total: the old `child: total` logged a permanent zero
@@ -913,6 +931,8 @@ impl Helper {
                 session: "-",
                 total,
                 child,
+                // Listing and closing never acquire: no window can run.
+                window_new: std::time::Duration::ZERO,
                 ok: error.is_none(),
                 error: error.as_deref(),
             },
@@ -1133,6 +1153,13 @@ impl ServerHandler for Helper {
             .agent_for(&token)
             .await
             .ok_or_else(|| refused("unknown token"))?;
+        // M5: the auth layer stamped request entry; fall back to now only
+        // when the stamp is missing (direct in-process callers in tests).
+        let started = context
+            .extensions
+            .get::<RequestStarted>()
+            .map(|stamped| stamped.0)
+            .unwrap_or_else(std::time::Instant::now);
         let name = request.name.as_ref();
         if !DECLARED_TOOLS.iter().any(|(n, _)| *n == name) && name != "browser_cli" {
             return Err(ErrorData::new(
@@ -1146,7 +1173,7 @@ impl ServerHandler for Helper {
             .as_ref()
             .map(|map| Value::Object(map.clone()))
             .unwrap_or(Value::Null);
-        match self.run_tool(&agent, &token, name, &args).await {
+        match self.run_tool(&agent, &token, started, name, &args).await {
             Ok(blocks) => Ok(CallToolResult::success(blocks).into()),
             Err(HooError::Refused(message)) => Err(refused(&message)),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())]).into()),

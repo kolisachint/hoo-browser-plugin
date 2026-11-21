@@ -708,13 +708,18 @@ pub async fn run_command(
     }
 }
 
-/// One call's timing record for the overhead report.
+/// One call's timing record for the overhead report: `total` is the whole
+/// call (from the auth-layer entry stamp), `child` is agent-browser
+/// spawn-to-exit, and `window_new` is the wall time of the `window new`
+/// that gave a fresh lease its own window (zero when no window ran).
+/// Helper-only overhead is `total − child − window_new` (M5).
 pub struct CallRecord<'a> {
     pub tool: &'a str,
     pub agent: &'a str,
     pub session: &'a str,
     pub total: Duration,
     pub child: Duration,
+    pub window_new: Duration,
     pub ok: bool,
     pub error: Option<&'a str>,
 }
@@ -722,8 +727,9 @@ pub struct CallRecord<'a> {
 /// One JSON line per call for the overhead report (spec B2: debug level, log
 /// file in the data dir, never tokens or argument values). Times are
 /// microseconds from request entry: `child_us` is the agent-browser
-/// spawn-to-exit (including its daemon connect), `overhead_us` is everything
-/// else the helper adds (M5).
+/// spawn-to-exit (including its daemon connect), `window_new_us` is the
+/// `window new` wall time for a fresh lease, and `overhead_us` is
+/// everything else the helper adds (M5).
 pub async fn log_call(log_path: &Path, record: CallRecord<'_>) {
     let line = serde_json::json!({
         "tool": record.tool,
@@ -731,7 +737,12 @@ pub async fn log_call(log_path: &Path, record: CallRecord<'_>) {
         "session": record.session,
         "total_us": record.total.as_micros(),
         "child_us": record.child.as_micros(),
-        "overhead_us": record.total.saturating_sub(record.child).as_micros(),
+        "window_new_us": record.window_new.as_micros(),
+        "overhead_us": record
+            .total
+            .saturating_sub(record.child)
+            .saturating_sub(record.window_new)
+            .as_micros(),
         "ok": record.ok,
         "error": record.error.map(|e| e.chars().take(300).collect::<String>()),
     });

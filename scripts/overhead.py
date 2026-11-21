@@ -2,9 +2,12 @@
 """Overhead report for hoo-browser (M5).
 
 Reads the JSON lines the helper appends to <data dir>/hoo-browser.log and
-prints p50/p95 for both halves of every call:
+prints p50/p95 for all three parts of every call:
 
 - helper-only (overhead_us): request entry to response minus the child run
+  minus window new
+- window-new (window_new_us): the `window new` wall time that gave a fresh
+  lease its own window (zero when no window ran)
 - spawn+connect (child_us): the agent-browser spawn-to-exit, including its
   daemon connect
 
@@ -28,6 +31,7 @@ def main() -> int:
         print(f"usage: {sys.argv[0]} <hoo-browser.log>", file=sys.stderr)
         return 2
     overheads = []
+    windows = []
     children = []
     calls = 0
     with open(sys.argv[1], encoding="utf-8") as handle:
@@ -43,11 +47,14 @@ def main() -> int:
                 continue
             calls += 1
             overheads.append(value["overhead_us"])
+            # Lines from before the window-new split have no such field.
+            windows.append(value.get("window_new_us", 0))
             children.append(value["child_us"])
     if calls == 0:
         print("no overhead lines found")
         return 1
     overheads.sort()
+    windows.sort()
     children.sort()
     print(f"calls: {calls}")
     print(
@@ -55,6 +62,13 @@ def main() -> int:
             percentile(overheads, 50),
             percentile(overheads, 95),
             overheads[-1],
+        )
+    )
+    print(
+        "window-new window_new_us: p50={} p95={} max={}".format(
+            percentile(windows, 50),
+            percentile(windows, 95),
+            windows[-1],
         )
     )
     print(

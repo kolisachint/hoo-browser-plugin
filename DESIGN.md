@@ -32,7 +32,8 @@ never listed): the CLI fallback for the long tail. Permission hints live in
 act; eval dangerous. Screenshots return MCP image content (the CLI writes a
 file; the helper reads it back and base64s it).
 
-Overhead: whole-call time minus the agent-browser spawn-to-exit, one JSON
+Overhead: whole-call time (stamped at request entry in the auth layer)
+minus the agent-browser spawn-to-exit minus `window new`, one JSON
 line per call in `<data dir>/hoo-browser.log` (never tokens). Target < 20 ms
 p95; the real integration suite prints p50/p95.
 
