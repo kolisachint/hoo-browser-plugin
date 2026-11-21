@@ -1,0 +1,147 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "hoo-browser",
+  "version": "0.1.0",
+  "description": "Browser automation for hoocode: one shared Chromium driven via the agent-browser CLI, one tab lease per agent over a tier C helper.",
+  "license": "MIT",
+  "repository": "https://github.com/kolisachint/hoo-browser-plugin",
+  "keywords": ["browser", "automation", "chromium", "agent-browser"],
+  "extensions": {
+    "dev.hoocode": {
+      "native": {
+        "server": "hoo-browser",
+        "shared": true,
+        "binaries": {
+          "linux-x86_64": {
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-linux-x86_64",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "linux-aarch64": {
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-linux-aarch64",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "darwin-aarch64": {
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-darwin-aarch64",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "darwin-x86_64": {
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-darwin-x86_64",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        },
+        "tools": [
+          {
+            "name": "browser_open",
+            "description": "Open a URL in the caller's tab (agent-browser `open`).",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "url": { "type": "string" },
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+              },
+              "required": ["url"]
+            },
+            "permission": "read"
+          },
+          {
+            "name": "browser_snapshot",
+            "description": "Accessibility snapshot of the caller's tab: refs for `browser_act`, text for reading.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
+                "interactive": { "type": "boolean", "description": "Cursor position and interactive-only refs." }
+              },
+              "required": []
+            },
+            "permission": "read"
+          },
+          {
+            "name": "browser_act",
+            "description": "Act on a ref from the snapshot: click, fill, select, check, uncheck, hover, press.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "action": { "type": "string", "enum": ["click", "fill", "select", "check", "uncheck", "hover", "press"] },
+                "ref": { "type": "string", "description": "Ref from the snapshot (e.g. \"e3\")." },
+                "value": { "type": "string", "description": "Text for fill, option for select, key for press." },
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+              },
+              "required": ["action", "ref"]
+            },
+            "permission": "act"
+          },
+          {
+            "name": "browser_screenshot",
+            "description": "Screenshot of the caller's tab, returned as an image.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
+                "full_page": { "type": "boolean", "description": "Capture the full page, not just the viewport." }
+              },
+              "required": []
+            },
+            "permission": "read"
+          },
+          {
+            "name": "browser_tabs",
+            "description": "List this agent's tabs, close one, or (root only) adopt another agent's tabs.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "action": { "type": "string", "enum": ["list", "close", "adopt"] },
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
+                "from": { "type": "string", "description": "Agent id to adopt tabs from (adopt only, root only)." }
+              },
+              "required": ["action"]
+            },
+            "permission": "act"
+          },
+          {
+            "name": "browser_wait",
+            "description": "Wait in the caller's tab: milliseconds, text, ref, or load state.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
+                "ms": { "type": "integer", "description": "Milliseconds to wait." },
+                "text": { "type": "string", "description": "Text to wait for." },
+                "ref": { "type": "string", "description": "Ref to wait for (from the snapshot)." },
+                "load": { "type": "string", "description": "Load state to wait for (e.g. networkidle)." }
+              },
+              "required": []
+            },
+            "permission": "read"
+          },
+          {
+            "name": "browser_nav",
+            "description": "Navigate the caller's tab: back, forward, reload.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "action": { "type": "string", "enum": ["back", "forward", "reload"] },
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+              },
+              "required": ["action"]
+            },
+            "permission": "act"
+          },
+          {
+            "name": "browser_eval",
+            "description": "Run JavaScript in the caller's tab and return the result.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "js": { "type": "string" },
+                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+              },
+              "required": ["js"]
+            },
+            "permission": "dangerous"
+          }
+        ]
+      }
+    }
+  }
+}

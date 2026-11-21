@@ -1,134 +1,62 @@
-# browsertools
+# hoo-browser
 
-A deterministic browser engine with **no LLM in-process**. It drives Chromium
-over raw CDP (via `chromiumoxide`) and exposes three things:
-
-- **`run-flow`** — replay a saved flow once, deterministically, and write a
-  tamper-evident evidence bundle. Zero LLM calls.
-- **`serve`** — a long-running stdio JSON-RPC server exposing the browser
-  primitives (`navigate`, `click`, `fill`, `observe`, …) to a parent process.
-- **live view** — a WebSocket screencast of the live page with synced action
-  events, for watching a session in real time.
-
-The thesis: once a flow is recorded, replaying it is fully deterministic and
-needs no model. The parent (an LLM agent) is only involved when *discovering* a
-flow or resolving genuine ambiguity — never on the hot replay path. See
-`DESIGN.md` for the full architecture and the Phase 2/3 escalation contract
-(`src/contract.rs`).
+Tier C native helper for the hoo-browser plugin: one shared Chromium driven
+via the agent-browser CLI, with one tab lease per agent over MCP Streamable
+HTTP on a local socket. Spec: `docs/design/plugins.md` in hoocode ("Native
+tier contract", "Browser plugin"); build spec sections B2/B3.
 
 ## Build
 
-Chromium is expected at `/opt/pw-browsers/chromium` (this environment ships it).
+```bash
+cargo build        # binary: target/debug/hoo-browser
+```
+
+Needs Rust 1.100 (rust-toolchain pins it if present). No Chromium or
+agent-browser needed to build; both resolve at runtime:
+
+- agent-browser CLI: `HOO_BROWSER_AGENT_BROWSER` env, else the pinned file in
+  the data dir, else `PATH`.
+- Chromium: `HOO_BROWSER_CHROME` env, else agent-browser's own install
+  (`~/.agent-browser/browsers/`), else common install paths.
+
+## Test
 
 ```bash
-cargo build
+cargo test                                   # unit + fake-backend integration + manifest
+HOO_BROWSER_IT=1 \
+HOO_BROWSER_AGENT_BROWSER=$(which agent-browser) \
+HOO_BROWSER_CHROME=/path/to/chrome \
+  cargo test --test integration             # real agent-browser + headless Chromium
 ```
 
-## Replay a flow
+The real suite drives a local test page: open, snapshot, click by ref,
+screenshot, 3 agents x 2 tabs in parallel, cross-agent refusal, agentEnded,
+and prints the helper overhead p50/p95 (target < 20 ms).
 
-A flow is JSON: a list of steps (navigate / click / fill / select / wait /
-checkpoint) plus output extraction rules and `{{var}}` placeholders. See
-`fixtures/flows/bookstore_first_book.json`.
+Also useful:
 
 ```bash
-# Serve the bundled fixture site, then replay against it.
-python3 -m http.server 8734 --directory fixtures/site &
-target/debug/browsertools run-flow \
-  --flow fixtures/flows/bookstore_first_book.json \
-  --var base=http://127.0.0.1:8734/ \
-  --store .hoocode
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+python3 scripts/update_manifest.py --version 0.1.0 --dir ./dist  # pin release sha256s
 ```
 
-`run-flow` prints the `RunResult` JSON (status, per-step trace, extracted
-outputs, screenshot hash) and exits non-zero if the flow failed. The evidence
-bundle is written under:
+## Run
 
-```
-.hoocode/flows/<flow_id>/runs/<run_id>/
-  evidence.png      full-page screenshot
-  extracted.json    extracted fields + screenshot hash
-  trace.json        the full RunResult
-```
-
-## Serve mode (primitives over stdio)
-
-Newline-delimited JSON requests in, responses out. On start it emits
-`{"event":"ready"}`.
+The hoocode supervisor starts the helper; humans rarely run it by hand:
 
 ```bash
-target/debug/browsertools serve
-# then write requests to stdin, one JSON object per line:
-{"id":1,"method":"navigate","params":{"url":"http://127.0.0.1:8732/"}}
-{"id":2,"method":"observe"}
-{"id":3,"method":"shutdown"}
+# helper mode (env set by the supervisor, --parent-pid required)
+HOOCODE_HELPER_SOCKET=/tmp/h.sock HOOCODE_HELPER_TOKEN=<root> \
+HOO_BROWSER_DATA=~/.agents/plugin-data/hoo-browser \
+  hoo-browser --parent-pid <hoocode-pid>
+
+# CLI fallback from inside an agent Shell (env set by hoocode per helper)
+hoo-browser cli snapshot
+hoo-browser --session root_task-1-1 eval "document.title"
 ```
 
-## Parent-in-the-loop replay (Tier 2)
-
-Replay normally needs no model. When a flow hits something only an LLM can
-resolve, the engine does not fail: it **suspends** and yields a typed
-`ParentRequest` so the parent (the LLM agent) can resolve it, then **resumes**
-deterministically. This runs over `serve`, where the browser persists across the
-suspension. All five yield points in the contract are wired:
-
-- **`reidentify_element`** — a click whose selector has *drifted* off the live
-  DOM; the parent supplies a corrected selector.
-- **`decide_next_action`** — a `decide` step (a recorded decision point with no
-  fixed action); the engine hands over the page `observation` and the parent
-  returns the concrete primitive action to run next.
-- **`classify_state`** — a `classify` step; the parent labels the current page.
-- **`verify_visual`** — a `verify_visual` step; the parent confirms the page
-  matches an expected state. A `false` verdict fails the run, like a checkpoint.
-- **`extract_semantic`** — an `extract_semantic` step; the parent reads fields
-  that live in pixels (charts, canvas), merged into the run outputs.
-
-```jsonc
-// Start a flow (inline `flow` object or `flow_path`, plus vars):
-{"id":1,"method":"flow_start","params":{"flow":{...},"vars":{"base":"http://…/"}}}
-
-// If the engine needs help it replies with a pause instead of a result:
-{"id":1,"result":{"outcome":"needs_parent",
-  "request":{"request":"reidentify_element","screenshot_ref":"…","description":"…"},
-  "token":"run_…:1"}}
-
-// The parent can fetch the referenced screenshot bytes to reason over them
-// (the ref is the blake3 hash of the PNG):
-{"id":9,"method":"get_resource","params":{"ref":"…"}}
-{"id":9,"result":{"ref":"…","mime":"image/png","len":12345,"png_base64":"…"}}
-
-// The parent resolves it and resumes with a typed response:
-{"id":2,"method":"flow_resume","params":{"token":"run_…:1",
-  "response":{"response":"element","selector":".product_pod h3 a"}}}
-
-// …which runs to completion (or pauses again):
-{"id":2,"result":{"outcome":"complete","result":{"status":"success", …}}}
-```
-
-The request/response variants are the frozen contract in `src/contract.rs`, all
-wired through the same pause/resume machinery. See `tests/tier2_reidentify.rs`,
-`tests/tier2_decide.rs`, and `tests/tier2_judgment.rs` for full round-trips.
-
-## Live view
-
-`serve` exposes `live_view_start`, which returns an HTTP URL; connect a
-WebSocket to `<url>ws` to receive JPEG `frame` messages and `action` events.
-`scripts/live_view_check.py` is a working client.
-
-## Tests
-
-Fast, pure-logic tests run with plain `cargo test`. The browser-driving paths
-need real Chromium and are marked `#[ignore]`:
-
-```bash
-# The whole end-to-end gate (replay thesis + serve + tier 2 + live view):
-bash scripts/e2e.sh
-
-# Or individually:
-cargo test --test thesis_replay     -- --ignored --nocapture   # 20x deterministic replay
-cargo test --test serve_primitives  -- --ignored --nocapture   # stdio protocol
-cargo test --test tier2_reidentify  -- --ignored --nocapture   # yield/resume contract
-```
-
-The thesis test asserts extraction is identical across 20 cold runs. It also
-reports whether the rendered screenshot was byte-identical; set
-`THESIS_STRICT_PIXELS=1` to make pixel-identity a hard requirement.
+Per-call overhead lines go to `<data dir>/hoo-browser.log` (debug level;
+never tokens). Backend selection: `HOO_BROWSER_BACKEND` (`chromium-headless`
+default, `chromium-headed`; `chrome` and `lightpanda` return "not yet
+supported", B4) or `HOO_BROWSER_HEADED=1`.
