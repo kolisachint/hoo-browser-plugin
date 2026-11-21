@@ -918,14 +918,21 @@ async fn cdp_page_targets(endpoint: &str) -> usize {
         .trim_start_matches("ws://")
         .trim_start_matches("wss://");
     let host_port = bare.split('/').next().unwrap_or("").to_owned();
-    let mut stream = tokio::net::TcpStream::connect(&host_port)
-        .await
-        .expect("cdp http");
-    let request =
-        format!("GET /json/list HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.expect("write");
-    let mut body = Vec::new();
-    stream.read_to_end(&mut body).await.expect("read");
+    // HTTP/1.0 (not 1.1 + Connection: close): the DevTools server
+    // keep-alives 1.1 connections, which would stall read_to_end forever.
+    // Bounded anyway: a wedged browser must fail the test, not hang it.
+    let body = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut stream = tokio::net::TcpStream::connect(&host_port)
+            .await
+            .expect("cdp http");
+        let request = format!("GET /json/list HTTP/1.0\r\nHost: {host_port}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).await.expect("read");
+        body
+    })
+    .await
+    .expect("cdp /json timed out");
     let text = String::from_utf8_lossy(&body);
     let json_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     serde_json::from_str::<Value>(&text[json_start..])
