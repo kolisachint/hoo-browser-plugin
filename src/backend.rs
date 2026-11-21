@@ -260,6 +260,8 @@ pub async fn launch_chromium(
     let profile = data_dir.join("profile");
     let _ = std::fs::create_dir_all(&profile);
     let mut cmd = tokio::process::Command::new(chrome);
+    // The browser inherits nothing secret or overriding (L1).
+    crate::exec::child_env(&mut cmd, None);
     if !headed {
         cmd.arg("--headless=new");
     }

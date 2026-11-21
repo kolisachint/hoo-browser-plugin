@@ -12,8 +12,36 @@ use tokio::process::Command;
 
 use crate::error::{short_stderr, HooError};
 
-/// Default per-call timeout for the agent-browser child.
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Per-call timeout for the agent-browser child, under hoocode's 60 s
+/// tool budget (M1). `browser_wait` is capped below this (see MAX_WAIT_MS).
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// `browser_wait` ceiling in ms: the whole CLI run (spawn, connect, wait)
+/// must fit inside [`CALL_TIMEOUT`].
+pub const MAX_WAIT_MS: u64 = 40_000;
+
+/// Daemon idle shutdown for agent-browser children, matching the helper's
+/// 10-minute lease sweep (H3): an idle daemon exits instead of lingering.
+pub const IDLE_TIMEOUT_MS: &str = "600000";
+
+/// Children must never inherit secrets or ambient overrides (L1): the helper
+/// and agent tokens stay in the helper, and every `AGENT_BROWSER_*` var is
+/// dropped except the two the helper sets itself (socket isolation and the
+/// idle timeout above).
+pub fn child_env(cmd: &mut tokio::process::Command, sock_dir: Option<&std::path::Path>) {
+    for (key, _) in std::env::vars() {
+        if key == "HOOCODE_HELPER_TOKEN"
+            || key == "HOOCODE_AGENT_TOKEN"
+            || key.starts_with("AGENT_BROWSER_")
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", IDLE_TIMEOUT_MS);
+    if let Some(dir) = sock_dir {
+        cmd.env("AGENT_BROWSER_SOCKET_DIR", dir);
+    }
+}
 
 /// What a tool call produced: plain JSON or a PNG for MCP image content.
 #[derive(Debug)]
@@ -139,6 +167,11 @@ pub fn tool_argv(
             } else if let Some(load) = str_arg("load").filter(|l| !l.is_empty()) {
                 argv.extend(["--load".to_owned(), load]);
             } else if let Some(ms) = args.get("ms").and_then(Value::as_u64) {
+                if ms > MAX_WAIT_MS {
+                    return Err(HooError::Failed(format!(
+                        "browser_wait ms={ms} exceeds the {MAX_WAIT_MS} ms per-call cap; wait again instead"
+                    )));
+                }
                 argv.push(ms.to_string());
             } else {
                 argv.push("1000".to_owned());
@@ -500,22 +533,23 @@ pub async fn run_command(
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| HooError::Spawn("empty argv".into()))?;
-    let output = tokio::time::timeout(
-        timeout,
-        Command::new(program)
-            .args(args)
-            .env("AGENT_BROWSER_SOCKET_DIR", sock_dir)
-            .stdin(std::process::Stdio::null())
-            .output(),
-    )
-    .await
-    .map_err(|_| {
-        HooError::Spawn(format!(
-            "agent-browser timed out after {}s",
-            timeout.as_secs()
-        ))
-    })?
-    .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
+    let mut child = Command::new(program);
+    child
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        // Timing out drops the future; without this the child keeps
+        // running orphaned. Scrubbed env: no tokens leak (L1).
+        .kill_on_drop(true);
+    child_env(&mut child, Some(sock_dir));
+    let output = tokio::time::timeout(timeout, child.output())
+        .await
+        .map_err(|_| {
+            HooError::Spawn(format!(
+                "agent-browser timed out after {}s",
+                timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
     if !output.status.success() {
         // Failures can land on either stream: usage errors go to stderr,
         // `--json` errors to stdout. Report both so nothing is lost.
@@ -731,6 +765,30 @@ mod tests {
             "s",
             "browser_screenshot",
             &json!({}),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn call_timeout_fits_hoocode_budget_and_wait_is_capped() {
+        assert!(CALL_TIMEOUT.as_secs() < 60);
+        assert!(Duration::from_millis(MAX_WAIT_MS) < CALL_TIMEOUT);
+        assert!(tool_argv(
+            Path::new("ab"),
+            "e",
+            "s",
+            "browser_wait",
+            &json!({"ms": 40_000}),
+            None
+        )
+        .is_ok());
+        assert!(tool_argv(
+            Path::new("ab"),
+            "e",
+            "s",
+            "browser_wait",
+            &json!({"ms": 40_001}),
             None
         )
         .is_err());

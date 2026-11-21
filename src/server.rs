@@ -622,22 +622,21 @@ impl Helper {
         let (program, args) = scoped
             .split_first()
             .ok_or_else(|| HooError::Spawn("empty argv".into()))?;
-        let output = tokio::time::timeout(
-            CALL_TIMEOUT,
-            Command::new(program)
-                .args(args)
-                .env("AGENT_BROWSER_SOCKET_DIR", &self.inner.sock_dir)
-                .stdin(std::process::Stdio::null())
-                .output(),
-        )
-        .await
-        .map_err(|_| {
-            HooError::Spawn(format!(
-                "agent-browser timed out after {}s",
-                CALL_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
+        let mut child = Command::new(program);
+        child
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        exec::child_env(&mut child, Some(&self.inner.sock_dir));
+        let output = tokio::time::timeout(CALL_TIMEOUT, child.output())
+            .await
+            .map_err(|_| {
+                HooError::Spawn(format!(
+                    "agent-browser timed out after {}s",
+                    CALL_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if output.status.success() {
