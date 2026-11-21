@@ -50,7 +50,10 @@ pub fn tool_argv(
             let url = str_arg("url")
                 .filter(|u| !u.is_empty())
                 .ok_or_else(|| HooError::Failed("browser_open needs \"url\"".into()))?;
-            push(&mut argv, &["open", &url]);
+            refuse_dash("url", &url)?;
+            // `open` takes one positional (`scan_single`): `--` ends option
+            // parsing so the url is always data, never a flag.
+            push(&mut argv, &["open", "--", &url]);
         }
         "browser_snapshot" => {
             push(&mut argv, &["snapshot"]);
@@ -63,16 +66,23 @@ pub fn tool_argv(
             let reference = str_arg("ref")
                 .filter(|r| !r.is_empty())
                 .ok_or_else(|| HooError::Failed("browser_act needs \"ref\"".into()))?;
+            // Refs come from snapshots (`e3`); a leading `-` would parse as
+            // a flag in the CLI (`scan_single` rejects it), so refuse early.
+            refuse_dash("ref", &reference)?;
+            // `click`/`hover`/`check`/`uncheck` take one positional via
+            // `scan_single`, which honors `--`; `fill` skips `--` explicitly
+            // in its parser. `select` joins the rest literally and has no
+            // `--` handling, so its value passes through as data already.
             match action.as_str() {
-                "click" => push(&mut argv, &["click", &reference]),
-                "hover" => push(&mut argv, &["hover", &reference]),
-                "check" => push(&mut argv, &["check", &reference]),
-                "uncheck" => push(&mut argv, &["uncheck", &reference]),
+                "click" => push(&mut argv, &["click", "--", &reference]),
+                "hover" => push(&mut argv, &["hover", "--", &reference]),
+                "check" => push(&mut argv, &["check", "--", &reference]),
+                "uncheck" => push(&mut argv, &["uncheck", "--", &reference]),
                 "fill" => {
                     let value = str_arg("value").ok_or_else(|| {
                         HooError::Failed("browser_act fill needs \"value\"".into())
                     })?;
-                    push(&mut argv, &["fill", &reference, &value]);
+                    push(&mut argv, &["fill", &reference, "--", &value]);
                 }
                 "select" => {
                     let value = str_arg("value").ok_or_else(|| {
@@ -124,6 +134,7 @@ pub fn tool_argv(
             if let Some(text) = str_arg("text").filter(|t| !t.is_empty()) {
                 argv.extend(["--text".to_owned(), text]);
             } else if let Some(reference) = str_arg("ref").filter(|r| !r.is_empty()) {
+                refuse_dash("ref", &reference)?;
                 argv.push(reference);
             } else if let Some(load) = str_arg("load").filter(|l| !l.is_empty()) {
                 argv.extend(["--load".to_owned(), load]);
@@ -148,7 +159,16 @@ pub fn tool_argv(
             let js = str_arg("js")
                 .filter(|j| !j.is_empty())
                 .ok_or_else(|| HooError::Failed("browser_eval needs \"js\"".into()))?;
-            push(&mut argv, &["eval", &js]);
+            // `eval` reads its first token for `-b`/`--base64`/`--stdin`
+            // and has no `--` handling: a script starting with `-` goes
+            // over as base64 (`eval -b`) so it cannot misparse as a flag.
+            if js.starts_with('-') {
+                use base64::Engine as _;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(js.as_bytes());
+                push(&mut argv, &["eval", "-b", &encoded]);
+            } else {
+                push(&mut argv, &["eval", &js]);
+            }
         }
         _ => return Err(HooError::Failed(format!("unknown tool {tool}"))),
     }
@@ -444,6 +464,18 @@ fn disallowed_hint(command: &str) -> &'static str {
     }
 }
 
+/// Values that would parse as CLI flags are refused: refs and urls
+/// always travel past `--`, but a leading `-` there means the caller is
+/// forging them rather than reading snapshots (M3).
+fn refuse_dash(what: &str, value: &str) -> Result<(), HooError> {
+    if value.starts_with('-') {
+        return Err(HooError::Failed(format!(
+            "{what} must not start with `-`: got {value:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn check_session(value: &str, owned: &[String]) -> Result<(), HooError> {
     if owned.iter().any(|s| s == value) {
         Ok(())
@@ -606,7 +638,7 @@ mod tests {
     fn open_snapshot_act_shapes() {
         assert_eq!(
             tail("browser_open", json!({"url": "https://x.example/"})),
-            vec!["open", "https://x.example/"]
+            vec!["open", "--", "https://x.example/"]
         );
         assert_eq!(tail("browser_snapshot", json!({})), vec!["snapshot"]);
         assert_eq!(
@@ -615,14 +647,14 @@ mod tests {
         );
         assert_eq!(
             tail("browser_act", json!({"action": "click", "ref": "e3"})),
-            vec!["click", "e3"]
+            vec!["click", "--", "e3"]
         );
         assert_eq!(
             tail(
                 "browser_act",
                 json!({"action": "fill", "ref": "e3", "value": "hi"})
             ),
-            vec!["fill", "e3", "hi"]
+            vec!["fill", "e3", "--", "hi"]
         );
         assert_eq!(
             tail(
@@ -633,15 +665,15 @@ mod tests {
         );
         assert_eq!(
             tail("browser_act", json!({"action": "check", "ref": "e3"})),
-            vec!["check", "e3"]
+            vec!["check", "--", "e3"]
         );
         assert_eq!(
             tail("browser_act", json!({"action": "uncheck", "ref": "e3"})),
-            vec!["uncheck", "e3"]
+            vec!["uncheck", "--", "e3"]
         );
         assert_eq!(
             tail("browser_act", json!({"action": "hover", "ref": "e3"})),
-            vec!["hover", "e3"]
+            vec!["hover", "--", "e3"]
         );
         assert_eq!(
             tail(
@@ -765,6 +797,51 @@ mod tests {
     }
 
     #[test]
+    fn values_travel_past_end_of_options() {
+        use base64::Engine as _;
+        // Refs and urls that look like flags are refused outright.
+        for (tool, args) in [
+            ("browser_open", json!({"url": "--profile"})),
+            ("browser_act", json!({"action": "click", "ref": "--json"})),
+            (
+                "browser_act",
+                json!({"action": "fill", "ref": "-e", "value": "x"}),
+            ),
+            ("browser_wait", json!({"ref": "--state"})),
+        ] {
+            assert!(
+                tool_argv(Path::new("ab"), "e", "s", tool, &args, None).is_err(),
+                "{tool} {args} must be refused"
+            );
+        }
+        // `select` joins its value literally (no `--` handling upstream),
+        // so a dash value is data, not a flag — but the ref is still checked.
+        assert_eq!(
+            tail(
+                "browser_act",
+                json!({"action": "select", "ref": "e3", "value": "--x"})
+            ),
+            vec!["select", "e3", "--x"]
+        );
+        // A script starting with `-` goes over as base64 (`eval -b`),
+        // since `eval` has no `--` handling and reads `-b`/`--stdin` first.
+        let full = tool_argv(
+            Path::new("ab"),
+            "e",
+            "s",
+            "browser_eval",
+            &json!({"js": "-1 + -2"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(&full[6..8], &["eval", "-b"]);
+        assert_eq!(
+            full[8],
+            base64::engine::general_purpose::STANDARD.encode("-1 + -2")
+        );
+    }
+
+    #[test]
     fn cli_scoping_refuses_foreign_sessions() {
         let owned = vec!["root_task-1-1".to_owned()];
         // No --session: the default lease is injected, --cdp/--pin-tab first.
@@ -882,9 +959,9 @@ mod tests {
         }
         // The in-session long tail stays usable.
         for raw in [
-            vec!["open", "https://x.example/"],
+            vec!["open", "--", "https://x.example/"],
             vec!["snapshot", "--interactive"],
-            vec!["click", "e3"],
+            vec!["click", "--", "e3"],
             vec!["fill", "e3", "hello"],
             vec!["wait", "--text", "done"],
             vec!["eval", "document.title"],

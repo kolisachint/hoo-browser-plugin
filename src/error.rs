@@ -63,10 +63,14 @@ pub fn short_stderr(stderr: &str) -> String {
     const MAX: usize = 2000;
     let trimmed = stderr.trim();
     if trimmed.len() <= MAX {
-        trimmed.to_owned()
-    } else {
-        format!("…{}", &trimmed[trimmed.len() - MAX..])
+        return trimmed.to_owned();
     }
+    // Cut on a char boundary: byte-slicing mid-emoji panics (M2).
+    let mut start = trimmed.len() - MAX;
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &trimmed[start..])
 }
 
 #[cfg(test)]
@@ -85,5 +89,18 @@ mod tests {
         let long = "e".repeat(5000);
         assert!(short_stderr(&long).chars().count() <= 2001);
         assert_eq!(short_stderr("  hi  "), "hi");
+    }
+
+    #[test]
+    fn stderr_tail_never_splits_a_char() {
+        // The cut lands inside multibyte chars here; byte-slicing would panic.
+        let long = "🖥".repeat(1500);
+        let tail = short_stderr(&long);
+        assert!(tail.chars().count() <= 2001);
+        assert!(tail.starts_with('…'));
+        let mixed = format!("{}{}", "e".repeat(1999), "🖥");
+        let tail = short_stderr(&mixed);
+        assert!(tail.chars().count() <= 2001);
+        assert!(tail.ends_with('🖥'));
     }
 }
