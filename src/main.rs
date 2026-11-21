@@ -176,3 +176,28 @@ async fn run() -> Result<(), HooError> {
     tokio::spawn(server::sweep_loop(helper.clone()));
     server::serve(helper, socket).await
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_alive_sees_live_and_dead_pids() {
+        // Our own pid is alive; a pid above any real pid_max (2^22) is not.
+        // (u32::MAX would wrap to -1 as pid_t and signal everything, so a
+        // large-but-valid pid is used instead.)
+        assert!(parent_alive(std::process::id()));
+        assert!(!parent_alive(2_000_000_000));
+    }
+
+    #[test]
+    fn parent_pid_arg_parses_and_rejects() {
+        assert_eq!(
+            parse_args(&["--parent-pid".to_owned(), "42".to_owned()]).unwrap(),
+            (Some(42), vec![])
+        );
+        assert!(parse_args(&["--parent-pid".to_owned()]).is_err());
+        assert!(parse_args(&["--parent-pid".to_owned(), "nope".to_owned()]).is_err());
+    }
+}

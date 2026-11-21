@@ -447,43 +447,31 @@ pub fn scope_cli_args(
 
 /// Per-command restrictions inside the caller's own session.
 fn check_command_rest(command: &str, rest: &[String]) -> Result<(), HooError> {
-    match command {
-        // `get cdp-url` leaks the shared endpoint; the rest reads the page.
-        "get" => {
-            if rest.first().is_some_and(|s| s == "cdp-url") {
-                return Err(HooError::Refused(
-                    "browser_cli: `get cdp-url` is not allowed (the shared browser is not optional)"
-                        .into(),
-                ));
-            }
-        }
-        // `tab <id>` would switch to another tab and `tab new/close` manage
-        // tabs around the helper; only listing stays.
-        "tab" => {
-            if rest.first().is_some_and(|s| s != "list") {
-                return Err(HooError::Refused(
-                    "browser_cli: only `tab list` is allowed (use browser_tabs to close)".into(),
-                ));
-            }
-        }
-        // `window` only builds new windows; keep it that way.
-        "window" => {
-            if !rest.first().is_some_and(|s| s == "new") {
-                return Err(HooError::Refused(
-                    "browser_cli: only `window new` is allowed".into(),
-                ));
-            }
-        }
-        // `close --all` would close every agent's sessions; a bare `close`
-        // only ends the caller's own lease.
-        "close" => {
-            if rest.iter().any(|a| a.starts_with('-')) {
-                return Err(HooError::Refused(
-                    "browser_cli: `close --all` is not allowed (use browser_tabs close)".into(),
-                ));
-            }
-        }
-        _ => {}
+    // `get cdp-url` leaks the shared endpoint; the rest reads the page.
+    if command == "get" && rest.first().is_some_and(|s| s == "cdp-url") {
+        return Err(HooError::Refused(
+            "browser_cli: `get cdp-url` is not allowed (the shared browser is not optional)".into(),
+        ));
+    }
+    // `tab <id>` would switch to another tab and `tab new/close` manage
+    // tabs around the helper; only listing stays.
+    if command == "tab" && rest.first().is_some_and(|s| s != "list") {
+        return Err(HooError::Refused(
+            "browser_cli: only `tab list` is allowed (use browser_tabs to close)".into(),
+        ));
+    }
+    // `window` only builds new windows; keep it that way.
+    if command == "window" && !rest.first().is_some_and(|s| s == "new") {
+        return Err(HooError::Refused(
+            "browser_cli: only `window new` is allowed".into(),
+        ));
+    }
+    // `close --all` would close every agent's sessions; a bare `close`
+    // only ends the caller's own lease.
+    if command == "close" && rest.iter().any(|a| a.starts_with('-')) {
+        return Err(HooError::Refused(
+            "browser_cli: `close --all` is not allowed (use browser_tabs close)".into(),
+        ));
     }
     Ok(())
 }

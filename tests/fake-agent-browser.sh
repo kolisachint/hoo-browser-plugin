@@ -45,6 +45,10 @@ done
 
 cmd="${args[0]:-}"
 rest=("${args[@]:1}")
+# `--` ends option parsing upstream: positionals start after it.
+if [ "${rest[0]:-}" = "--" ]; then
+    rest=("${rest[@]:1}")
+fi
 
 ok() { printf '{"success":true,"data":%s,"error":null}\n' "$1"; }
 fail() { printf '{"success":false,"data":null,"error":%s}\n' "$1"; }

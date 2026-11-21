@@ -457,10 +457,7 @@ fn fake_wrapper(dir: &Path, argv_log: &Path, fail_file: Option<&Path>) -> PathBu
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
     let path = dir.join("fake-wrapper.sh");
-    let mut script = format!(
-        "#!/bin/bash\nexport FAKE_ARGV_LOG={}\n",
-        sh_quote(argv_log)
-    );
+    let mut script = format!("#!/bin/bash\nexport FAKE_ARGV_LOG={}\n", sh_quote(argv_log));
     if let Some(fail) = fail_file {
         script.push_str(&format!("export FAKE_FAIL_FILE={}\n", sh_quote(fail)));
     }
@@ -495,20 +492,38 @@ async fn fake_every_call_carries_session_and_pin_tab() {
     let root = connect(&socket, ROOT_TOKEN).await;
     notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
     let child = connect(&socket, "child-1-token").await;
-    call(&child, "browser_open", serde_json::json!({"url": "https://x.example/", "tab": 2}))
+    for tab in [1, 2] {
+        let opened = call(
+            &child,
+            "browser_open",
+            serde_json::json!({"url": "https://x.example/", "tab": tab}),
+        )
         .await
-        .expect("open tab 2");
+        .expect("open");
+        assert!(
+            !is_error(&opened),
+            "open tab {tab} failed: {}",
+            text_of(&opened)
+        );
+    }
     call(&child, "browser_snapshot", serde_json::json!({}))
         .await
         .expect("snapshot tab 1");
-    let cli = call(&child, "browser_cli", serde_json::json!({"args": ["snapshot"]}))
-        .await
-        .expect("cli");
+    let cli = call(
+        &child,
+        "browser_cli",
+        serde_json::json!({"args": ["snapshot"]}),
+    )
+    .await
+    .expect("cli");
     assert!(!is_error(&cli));
     let lines = argv_lines(&argv_log);
-    // open tab 2 (window new + open), snapshot tab 1, cli snapshot (window
-    // new for the default lease + snapshot): every spawn is scoped.
-    assert!(lines.len() >= 5, "expected several recorded calls, got {lines:?}");
+    // open tab 1 (window new + open), open tab 2 (window new + open),
+    // snapshot tab 1, cli snapshot on the default lease: every spawn scoped.
+    assert!(
+        lines.len() >= 6,
+        "expected several recorded calls, got {lines:?}"
+    );
     for line in &lines {
         assert!(line.contains("--pin-tab"), "leases pin their tab: {line}");
         assert!(
@@ -516,9 +531,18 @@ async fn fake_every_call_carries_session_and_pin_tab() {
             "shared browser is not optional: {line}"
         );
     }
-    let tab1: Vec<&String> = lines.iter().filter(|l| l.contains("root_task-1-1")).collect();
-    let tab2: Vec<&String> = lines.iter().filter(|l| l.contains("root_task-1-2")).collect();
-    assert!(!tab1.is_empty() && !tab2.is_empty(), "both tabs used: {lines:?}");
+    let tab1: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("root_task-1-1"))
+        .collect();
+    let tab2: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("root_task-1-2"))
+        .collect();
+    assert!(
+        !tab1.is_empty() && !tab2.is_empty(),
+        "both tabs used: {lines:?}"
+    );
     assert!(
         lines.iter().all(|l| l.contains("root_task-1-")),
         "no call escapes the agent's leases: {lines:?}"
@@ -535,9 +559,13 @@ async fn fake_window_new_failure_rolls_the_lease_back() {
     let root = connect(&socket, ROOT_TOKEN).await;
     notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
     let child = connect(&socket, "child-1-token").await;
-    call(&child, "browser_open", serde_json::json!({"url": "https://x.example/"}))
-        .await
-        .expect("open tab 1");
+    call(
+        &child,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open tab 1");
     // Fail tab 2's window: the open errors and the lease is rolled back.
     std::fs::write(&fail_file, "root_task-1-2\n").expect("fail file");
     let bad = call(
@@ -547,17 +575,29 @@ async fn fake_window_new_failure_rolls_the_lease_back() {
     )
     .await
     .expect("protocol ok");
-    assert!(is_error(&bad), "window-new failure must surface: {}", text_of(&bad));
-    // No phantom tab: tab 3 is still out of reach, tab 1 is untouched.
-    let skip = call(&child, "browser_snapshot", serde_json::json!({"tab": 3}))
-        .await
-        .expect("protocol ok");
-    assert!(is_error(&skip), "tab 3 must not exist: {}", text_of(&skip));
+    assert!(
+        is_error(&bad),
+        "window-new failure must surface: {}",
+        text_of(&bad)
+    );
+    // No phantom tab: the failed window never ran an open, and tab 1 is
+    // untouched.
+    let calls = argv_lines(&argv_log);
+    let opened_tab2 = |calls: &[String]| {
+        calls
+            .iter()
+            .any(|l| l.contains("--session root_task-1-2") && l.contains(" open "))
+    };
+    assert!(
+        !opened_tab2(&calls),
+        "no open ran on the failed lease: {calls:?}"
+    );
     let tab1 = call(&child, "browser_snapshot", serde_json::json!({}))
         .await
         .expect("tab 1 survives");
     assert!(!is_error(&tab1));
-    // The failure lifted: tab 2 opens in the same slot.
+    // The failure lifted: tab 2 opens under its canonical name, proving
+    // the rollback freed the lease (a stale lease would force a suffix).
     std::fs::remove_file(&fail_file).expect("unfail");
     let tab2 = call(
         &child,
@@ -567,6 +607,11 @@ async fn fake_window_new_failure_rolls_the_lease_back() {
     .await
     .expect("tab 2 reopens");
     assert!(!is_error(&tab2), "tab 2 must reopen: {}", text_of(&tab2));
+    let calls = argv_lines(&argv_log);
+    assert!(
+        opened_tab2(&calls),
+        "tab 2 reuses its name after rollback: {calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -578,23 +623,39 @@ async fn fake_closing_a_tab_keeps_the_others() {
     notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
     let child = connect(&socket, "child-1-token").await;
     for tab in [1, 2] {
-        call(&child, "browser_open", serde_json::json!({"url": "https://x.example/", "tab": tab}))
-            .await
-            .expect("open");
-    }
-    let closed = call(&child, "browser_tabs", serde_json::json!({"action": "close", "tab": 1}))
+        call(
+            &child,
+            "browser_open",
+            serde_json::json!({"url": "https://x.example/", "tab": tab}),
+        )
         .await
-        .expect("close tab 1");
+        .expect("open");
+    }
+    let closed = call(
+        &child,
+        "browser_tabs",
+        serde_json::json!({"action": "close", "tab": 1}),
+    )
+    .await
+    .expect("close tab 1");
     assert!(!is_error(&closed), "close failed: {}", text_of(&closed));
     // Tab 2 is unaffected (no renumbering); tab 1 reopens fresh.
     let tab2 = call(&child, "browser_snapshot", serde_json::json!({"tab": 2}))
         .await
         .expect("tab 2");
     assert!(!is_error(&tab2), "tab 2 must survive: {}", text_of(&tab2));
-    let reopened = call(&child, "browser_open", serde_json::json!({"url": "https://y.example/", "tab": 1}))
-        .await
-        .expect("reopen tab 1");
-    assert!(!is_error(&reopened), "tab 1 must reopen: {}", text_of(&reopened));
+    let reopened = call(
+        &child,
+        "browser_open",
+        serde_json::json!({"url": "https://y.example/", "tab": 1}),
+    )
+    .await
+    .expect("reopen tab 1");
+    assert!(
+        !is_error(&reopened),
+        "tab 1 must reopen: {}",
+        text_of(&reopened)
+    );
 }
 
 #[tokio::test]
@@ -613,11 +674,19 @@ async fn fake_spawn_and_timeout_failures_are_tool_errors() {
     tokio::spawn(hoo_browser::server::serve(helper, socket.clone()));
     wait_for_socket(&socket).await;
     let root = connect(&socket, ROOT_TOKEN).await;
-    let failed = call(&root, "browser_open", serde_json::json!({"url": "https://x.example/"}))
-        .await
-        .expect("protocol ok");
+    let failed = call(
+        &root,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("protocol ok");
     assert!(is_error(&failed), "spawn failure must be a tool error");
-    assert!(text_of(&failed).contains("cannot spawn"), "got: {}", text_of(&failed));
+    assert!(
+        text_of(&failed).contains("cannot spawn"),
+        "got: {}",
+        text_of(&failed)
+    );
 
     // A hanging agent-browser trips the per-call timeout (lowered for the
     // test; concurrent fake calls take milliseconds, far under either).
@@ -629,12 +698,20 @@ async fn fake_spawn_and_timeout_failures_are_tool_errors() {
     notify_started_child(&helper, &root, "root/slowpoke", "slow-token").await;
     let slow = connect(&socket, "slow-token").await;
     std::env::set_var("HOO_BROWSER_CALL_TIMEOUT_SECS", "1");
-    let timed = call(&slow, "browser_open", serde_json::json!({"url": "https://x.example/"}))
-        .await
-        .expect("protocol ok");
+    let timed = call(
+        &slow,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("protocol ok");
     std::env::remove_var("HOO_BROWSER_CALL_TIMEOUT_SECS");
     assert!(is_error(&timed), "timeout must be a tool error");
-    assert!(text_of(&timed).contains("timed out"), "got: {}", text_of(&timed));
+    assert!(
+        text_of(&timed).contains("timed out"),
+        "got: {}",
+        text_of(&timed)
+    );
 }
 
 /// Send `agentEnded` without waiting (ignored ones change nothing).
@@ -844,9 +921,8 @@ async fn cdp_page_targets(endpoint: &str) -> usize {
     let mut stream = tokio::net::TcpStream::connect(&host_port)
         .await
         .expect("cdp http");
-    let request = format!(
-        "GET /json/list HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET /json/list HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.expect("write");
     let mut body = Vec::new();
     stream.read_to_end(&mut body).await.expect("read");

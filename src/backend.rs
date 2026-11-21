@@ -508,7 +508,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         super::ensure_dir_0700(&dir.join("nested")).unwrap();
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&dir.join("nested"))
+        let mode = std::fs::metadata(dir.join("nested"))
             .unwrap()
             .permissions()
             .mode()
