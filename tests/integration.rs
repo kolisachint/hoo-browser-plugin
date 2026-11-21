@@ -33,10 +33,17 @@ fn test_tmp(name: &str) -> PathBuf {
 }
 
 async fn start_helper(agent_browser: &Path, data_dir: &Path) -> (Helper, PathBuf) {
+    start_helper_cdp(agent_browser, data_dir, "ws://fake-endpoint-for-tests").await
+}
+
+/// `start_helper` with a custom Chromium endpoint: mode tests point it at
+/// a fake DevTools listener so they can observe which targets a close
+/// removes.
+async fn start_helper_cdp(agent_browser: &Path, data_dir: &Path, cdp: &str) -> (Helper, PathBuf) {
     let socket = data_dir.join("helper.sock");
     let helper = Helper::new(
         agent_browser.to_owned(),
-        "ws://fake-endpoint-for-tests".into(),
+        cdp.into(),
         data_dir.to_owned(),
         hoo_browser::backend::socket_dir(data_dir),
         ROOT_TOKEN.into(),
@@ -886,6 +893,234 @@ async fn fake_closing_a_tab_keeps_the_others() {
         !is_error(&reopened),
         "tab 1 must reopen: {}",
         text_of(&reopened)
+    );
+}
+
+/// A fake DevTools endpoint: records each `GET /json/close/<targetId>`
+/// so mode tests can observe which targets a lease close removes.
+async fn fake_devtools() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = closed.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let mut stream = stream;
+                let mut lines = tokio::io::BufReader::new(&mut stream).lines();
+                let first = lines.next_line().await.ok().flatten().unwrap_or_default();
+                if let Some(path) = first.split_whitespace().nth(1) {
+                    seen.lock().unwrap().push(path.to_owned());
+                }
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let _ = lines
+                    .into_inner()
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            });
+        }
+    });
+    (
+        format!("ws://127.0.0.1:{port}/devtools/browser/fake"),
+        closed,
+        task,
+    )
+}
+
+#[tokio::test]
+async fn fake_version_probe_detects_fork_and_upstream() {
+    // B3: the mode comes from `agent-browser --version`: `-hoo.` in the
+    // output means the fork (scoped), anything else means safe.
+    use hoo_browser::backend;
+    let dir = test_tmp("version-probe");
+    let fake = dir.join("fake-agent-browser.sh");
+    std::fs::copy(manifest_dir().join("tests/fake-agent-browser.sh"), &fake).expect("copy fake");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    // SAFETY: FAKE_VERSION only affects the fake's `--version` output,
+    // which no other test invokes.
+    unsafe {
+        std::env::remove_var("HOO_BROWSER_AB_SCOPED");
+        std::env::set_var("FAKE_VERSION", "0.43.1-hoo.1");
+    }
+    let fork = backend::probe_ab_scoped(&fake).await;
+    unsafe {
+        std::env::set_var("FAKE_VERSION", "0.43.0");
+    }
+    let upstream = backend::probe_ab_scoped(&fake).await;
+    unsafe {
+        std::env::remove_var("FAKE_VERSION");
+    }
+    assert!(fork, "a -hoo.N version must mean scoped mode");
+    assert!(!upstream, "an upstream version must mean safe mode");
+    assert!(
+        backend::version_is_scoped("agent-browser 0.43.1-hoo.1"),
+        "fork versions carry -hoo."
+    );
+    assert!(
+        !backend::version_is_scoped("agent-browser 0.43.0"),
+        "upstream versions carry no -hoo."
+    );
+}
+
+#[tokio::test]
+async fn fake_safe_mode_closes_only_the_bound_tab() {
+    // Safe mode is the default: the shared `tab list` shows every lease's
+    // tabs, so a close removes only the bound target recorded at window
+    // open — never the live `active` flag (the fake marks another lease's
+    // tab active) and never other agents' targets. Listings show only the
+    // lease's own bound entry, never other agents' URLs.
+    let dir = test_tmp("safe-close");
+    let argv_log = dir.join("argv.log");
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
+    let (cdp, closed, _devtools) = fake_devtools().await;
+    let (_helper, socket) = start_helper_cdp(&fake, &dir, &cdp).await;
+    let peer = connect(&socket, ROOT_TOKEN).await;
+    call(
+        &peer,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    let list = call(&peer, "browser_tabs", serde_json::json!({"action": "list"}))
+        .await
+        .expect("list");
+    let text = text_of(&list);
+    assert!(
+        text.contains("TGT-root-1"),
+        "safe listing keeps the bound entry: {text}"
+    );
+    assert!(
+        !text.contains("other-agent"),
+        "safe listing never leaks other leases: {text}"
+    );
+    call(
+        &peer,
+        "browser_tabs",
+        serde_json::json!({"action": "close", "tab": 1}),
+    )
+    .await
+    .expect("close");
+    let closed = closed.lock().unwrap().clone();
+    assert_eq!(
+        closed,
+        vec!["/json/close/TGT-root-1"],
+        "safe close takes only the bound target: {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn fake_scoped_mode_closes_every_listed_target() {
+    // Scoped mode (fork): `tab list` is already owned-only, so listings
+    // pass through and a close removes every listed target.
+    let dir = test_tmp("scoped-close");
+    let argv_log = dir.join("argv.log");
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
+    let (cdp, closed, _devtools) = fake_devtools().await;
+    let (helper, socket) = start_helper_cdp(&fake, &dir, &cdp).await;
+    helper.set_scoped(true);
+    let peer = connect(&socket, ROOT_TOKEN).await;
+    call(
+        &peer,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    let list = call(&peer, "browser_tabs", serde_json::json!({"action": "list"}))
+        .await
+        .expect("list");
+    let text = text_of(&list);
+    assert!(
+        text.contains("other-agent"),
+        "scoped listing passes the owned list through: {text}"
+    );
+    call(
+        &peer,
+        "browser_tabs",
+        serde_json::json!({"action": "close", "tab": 1}),
+    )
+    .await
+    .expect("close");
+    let closed = closed.lock().unwrap().clone();
+    assert_eq!(
+        closed,
+        vec!["/json/close/TGT-root-1", "/json/close/TGT-other"],
+        "scoped close takes every listed target: {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn fake_browser_cli_tab_follows_the_mode() {
+    // B3: `browser_cli tab` is refused in safe mode and allowed (scoped)
+    // in scoped mode; other commands work in both.
+    let dir = test_tmp("cli-tab-mode");
+    let argv_log = dir.join("argv.log");
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
+    let (helper, socket) = start_helper(&fake, &dir).await;
+    let peer = connect(&socket, ROOT_TOKEN).await;
+    let refused = call(
+        &peer,
+        "browser_cli",
+        serde_json::json!({"args": ["tab", "list"]}),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "safe mode refuses browser_cli tab list: {refused:?}"
+    );
+    call(
+        &peer,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    let snapshot = call(
+        &peer,
+        "browser_cli",
+        serde_json::json!({"args": ["snapshot"]}),
+    )
+    .await
+    .expect("cli snapshot");
+    assert!(
+        !is_error(&snapshot),
+        "other cli commands work in safe mode: {}",
+        text_of(&snapshot)
+    );
+    helper.set_scoped(true);
+    let listed = call(
+        &peer,
+        "browser_cli",
+        serde_json::json!({"args": ["tab", "list"]}),
+    )
+    .await
+    .expect("scoped cli tab list");
+    assert!(
+        !is_error(&listed) && text_of(&listed).contains("TGT-"),
+        "scoped mode allows browser_cli tab list: {}",
+        text_of(&listed)
     );
 }
 

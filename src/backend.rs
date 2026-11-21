@@ -58,10 +58,64 @@ impl Backend {
     }
 }
 
+/// Fork detection (B3): the hoo fork's releases MUST carry a `-hoo.N`
+/// version (e.g. `0.43.1-hoo.1`), so `agent-browser --version` prints
+/// `agent-browser 0.43.1-hoo.1`. Upstream prints `agent-browser 0.43.0`
+/// (no `-hoo.`): the helper runs in safe mode there.
+///
+/// Two modes, chosen once at startup (see DESIGN.md):
+/// - scoped: the fork scopes `--pin-tab` sessions' `tab list`/switch to
+///   their owned tabs, so listings pass through and closes take every
+///   listed target.
+/// - safe: upstream agent-browser, whose `tab list` shows the whole
+///   shared browser. Closes take only the lease's bound target recorded
+///   at window open, `browser_tabs list` returns only the lease's own
+///   bound entry, and `browser_cli tab` is refused.
+pub fn version_is_scoped(version_output: &str) -> bool {
+    version_output.contains("-hoo.")
+}
+
+/// Env override for tests: `HOO_BROWSER_AB_SCOPED=1` forces scoped mode,
+/// `=0` forces safe mode. Anything else (or unset) probes the binary.
+pub fn ab_scoped_from_env() -> Option<bool> {
+    match std::env::var("HOO_BROWSER_AB_SCOPED")
+        .ok()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Chosen at startup (B3): the env override wins, else probe the
+/// agent-browser binary's `--version`. Anything unparsable (missing
+/// binary, timeout, odd output) means safe mode.
+pub async fn probe_ab_scoped(agent_browser: &Path) -> bool {
+    if let Some(forced) = ab_scoped_from_env() {
+        return forced;
+    }
+    let probe = tokio::process::Command::new(agent_browser)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = tokio::time::timeout(Duration::from_secs(10), probe).await else {
+        return false;
+    };
+    matches!(output, Ok(output)
+        if output.status.success()
+            && version_is_scoped(&String::from_utf8_lossy(&output.stdout)))
+}
+
 /// Pinned agent-browser release (spec B3). The pin points at the fork
 /// (`kolisachint/agent-browser`); the fork has no release with AB-1..AB-4
 /// yet, so the download stays unwired and the helper reports exactly where
-/// to put the binary.
+/// to put the binary. That first fork release MUST carry a `-hoo.N`
+/// version (see `version_is_scoped`): without it the helper cannot tell
+/// the fork from upstream and stays in safe mode.
 ///
 /// TODO(B3): cut the first fork release, fill `sha256` below from its
 /// assets, wire the download. Until then use a local build via

@@ -513,7 +513,19 @@ pub fn scope_cli_args(
     cdp: &str,
     default_session: &str,
     owned: &[String],
+    scoped: bool,
 ) -> Result<Vec<String>, HooError> {
+    // B3: fork tab scoping present
+    // B3: safe mode refuses `tab` entirely — upstream `tab list` shows
+    // the whole shared browser (other agents' URLs), and the helper's
+    // own safe `browser_tabs` list is the only listing. Scoped mode
+    // allows `tab list`: the fork scopes it to owned tabs.
+    if raw.first().is_some_and(|first| first == "tab") && !scoped {
+        return Err(HooError::Refused(
+            "browser_cli: `tab` is not available in safe mode (this agent-browser is upstream, not the fork with tab scoping); use browser_tabs"
+                .into(),
+        ));
+    }
     // Split at the first `--`: everything past it is literal data.
     let end_of_options = raw.iter().position(|a| a == "--").unwrap_or(raw.len());
     let (head, tail) = raw.split_at(end_of_options);
@@ -1234,8 +1246,14 @@ mod tests {
     fn cli_scoping_refuses_foreign_sessions() {
         let owned = vec!["root_task-1-1".to_owned()];
         // No --session: the default lease is injected, --cdp/--pin-tab first.
-        let scoped =
-            scope_cli_args(&["snapshot".to_owned()], "ws://e", "root_task-1-1", &owned).unwrap();
+        let scoped = scope_cli_args(
+            &["snapshot".to_owned()],
+            "ws://e",
+            "root_task-1-1",
+            &owned,
+            true,
+        )
+        .unwrap();
         assert_eq!(
             &scoped[..5],
             &["--cdp", "ws://e", "--pin-tab", "--session", "root_task-1-1"]
@@ -1251,6 +1269,7 @@ mod tests {
             "ws://e",
             "root_task-1-1",
             &owned,
+            true,
         )
         .unwrap();
         assert!(scoped.contains(&"root_task-1-1".to_owned()));
@@ -1264,6 +1283,7 @@ mod tests {
             "ws://e",
             "root_task-1-1",
             &owned,
+            true,
         )
         .is_err());
         assert!(scope_cli_args(
@@ -1271,6 +1291,7 @@ mod tests {
             "ws://e",
             "root_task-1-1",
             &owned,
+            true,
         )
         .is_err());
         // A custom --cdp is refused: the shared browser is not optional.
@@ -1283,6 +1304,40 @@ mod tests {
             "ws://e",
             "root_task-1-1",
             &owned,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cli_scoping_tab_needs_scoped_mode() {
+        let owned = vec!["root_task-1-1".to_owned()];
+        // Scoped mode allows `tab list` (the fork scopes it to owned tabs).
+        assert!(scope_cli_args(
+            &["tab".to_owned(), "list".to_owned()],
+            "ws://e",
+            "root_task-1-1",
+            &owned,
+            true,
+        )
+        .is_ok());
+        // Safe mode refuses even `tab list`: upstream shows the whole
+        // shared browser through it.
+        assert!(scope_cli_args(
+            &["tab".to_owned(), "list".to_owned()],
+            "ws://e",
+            "root_task-1-1",
+            &owned,
+            false,
+        )
+        .is_err());
+        // Safe mode refuses the mutating spellings too.
+        assert!(scope_cli_args(
+            &["tab".to_owned(), "close".to_owned()],
+            "ws://e",
+            "root_task-1-1",
+            &owned,
+            false,
         )
         .is_err());
     }
@@ -1294,7 +1349,8 @@ mod tests {
     #[test]
     fn cli_scoping_refuses_every_global_anywhere() {
         let owned = vec!["root_task-1-1".to_owned()];
-        let scope = |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned);
+        let scope =
+            |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned, true);
         // Trailing globals are refused, not just leading ones.
         for raw in [
             vec!["snapshot", "--session", "root-99"],
@@ -1329,7 +1385,8 @@ mod tests {
     #[test]
     fn cli_scoping_refuses_flags_after_the_command() {
         let owned = vec!["root_task-1-1".to_owned()];
-        let scope = |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned);
+        let scope =
+            |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned, true);
         // The motivating bypass: --json stripped before parsing, leaving
         // `get cdp-url` to leak the shared endpoint.
         for raw in [
@@ -1366,7 +1423,8 @@ mod tests {
     #[test]
     fn cli_scoping_is_an_allow_list() {
         let owned = vec!["root_task-1-1".to_owned()];
-        let scope = |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned);
+        let scope =
+            |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned, true);
         // Session management, provisioning, and state files are out.
         for raw in [
             vec!["session", "list"],

@@ -33,6 +33,11 @@ pub struct Lease {
     pub session: String,
     /// Owning agent id. `adopt` moves this to `root` without renaming.
     pub owner: String,
+    /// The DevTools target the helper saw for this lease right after its
+    /// window opened (matched by `tabId`, B3). Safe-mode closes and
+    /// listings use this — never the live `active` flag, which another
+    /// lease may have moved. Travels with the lease across `adopt`.
+    pub bound_target: Option<String>,
     pub last_used: Instant,
     /// Fresh leases stay initializing until `window new` gives them their
     /// own window (H2): concurrent first calls on a new tab wait on this
@@ -280,6 +285,7 @@ impl State {
             Lease {
                 session: session.clone(),
                 owner: agent_id.to_owned(),
+                bound_target: None,
                 last_used: Instant::now(),
                 initializing: true,
                 closing: false,
@@ -322,6 +328,16 @@ impl State {
         if let Some(lease) = self.leases.get_mut(session) {
             lease.initializing = false;
             lease.last_used = Instant::now();
+        }
+    }
+
+    /// Record the DevTools target the lease's window opened with (B3
+    /// safe mode: matched by `tabId` at window open, never the live
+    /// `active` flag). `None` when the post-open `tab list` failed: safe
+    /// closes then skip the DevTools step rather than guess.
+    pub fn set_bound_target(&mut self, session: &str, target: Option<String>) {
+        if let Some(lease) = self.leases.get_mut(session) {
+            lease.bound_target = target;
         }
     }
 

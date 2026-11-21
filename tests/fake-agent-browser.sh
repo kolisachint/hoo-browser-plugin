@@ -117,7 +117,11 @@ case "$cmd" in
         if [ -z "$path" ]; then fail '"no path"'; else printf '%s' "$FAKE_PNG_B64" | base64 -d > "$path" && ok "{\"path\":$(jstr "$path")}"; fi ;;
     "tab")
         case "${rest[0]:-}" in
-            "list") ok '{"tabs":[]}' ;;
+            # Two entries like the real shared browser: the lease's own
+            # tab (tabId matches `window new`) plus another lease's page.
+            # The own entry is deliberately NOT active, so tests prove the
+            # helper binds by targetId, never the live `active` flag.
+            "list") ok "{\"tabs\":[{\"tabId\":\"t9\",\"targetId\":\"TGT-$session\",\"active\":false,\"url\":\"https://own.example/$session\"},{\"tabId\":\"t1\",\"targetId\":\"TGT-other\",\"active\":true,\"url\":\"https://other-agent.example/\"}]}" ;;
             *) ok '{"closed":true}' ;;
         esac ;;
     "close") ok '{"closed":true}' ;;

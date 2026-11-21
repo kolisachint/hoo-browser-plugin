@@ -151,6 +151,10 @@ async fn run() -> Result<(), HooError> {
         chrome.display(),
         chromium.endpoint
     );
+    // B3: scoped (fork agent-browser) or safe (upstream) mode, chosen
+    // once at startup by probing the binary (`HOO_BROWSER_AB_SCOPED`
+    // forces it for tests).
+    let scoped = backend::probe_ab_scoped(&agent_browser).await;
     let helper = server::Helper::new(
         agent_browser,
         chromium.endpoint.clone(),
@@ -159,6 +163,14 @@ async fn run() -> Result<(), HooError> {
         root_token,
         root_agent,
     );
+    helper.set_scoped(scoped);
+    if !scoped {
+        eprintln!(
+            "hoo-browser: safe mode — the agent-browser here is upstream, not the fork with tab scoping. \
+             Lease closes take only the lease's bound tab, browser_tabs list shows only your own tabs, \
+             and browser_cli tab is refused. For full isolation use the fork agent-browser (see README)."
+        );
+    }
     helper
         .set_chromium(chromium.child, chromium.profile_lock)
         .await;

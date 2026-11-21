@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -97,6 +98,13 @@ pub struct Inner {
     /// path (sessionEnding, parent death, SIGTERM/SIGINT) removes it so no
     /// stale socket shadows the next helper.
     pub socket_path: Mutex<Option<PathBuf>>,
+    /// Scoped mode (B3): the agent-browser is the hoo fork (detected by
+    /// `-hoo.` in `--version`), so `--pin-tab` sessions' `tab list` shows
+    /// only their owned tabs: listings pass through and lease close takes
+    /// every listed target. Safe mode (upstream agent-browser) closes
+    /// only the bound target recorded at window open. Set once at
+    /// startup; tests set it directly. Defaults to safe.
+    pub ab_scoped: AtomicBool,
 }
 
 impl Helper {
@@ -122,8 +130,19 @@ impl Helper {
                 chromium: Mutex::new(None),
                 profile_lock: Mutex::new(None),
                 socket_path: Mutex::new(None),
+                ab_scoped: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Set scoped mode (B3): call once at startup from the `--version`
+    /// probe (`backend::probe_ab_scoped`), or directly in tests.
+    pub fn set_scoped(&self, scoped: bool) {
+        self.inner.ab_scoped.store(scoped, Ordering::SeqCst);
+    }
+
+    fn is_scoped(&self) -> bool {
+        self.inner.ab_scoped.load(Ordering::SeqCst)
     }
 
     /// Hand the shared Chromium to the helper so shutdown kills it.
@@ -608,9 +627,22 @@ impl Helper {
                 // The window-new wall time is reported separately (M5).
                 let window_started = std::time::Instant::now();
                 match self.open_window(&session, deadline).await {
-                    Ok(()) => {
+                    Ok(tab_id) => {
                         let window_new = window_started.elapsed();
                         self.inner.state.lock().await.mark_ready(&session);
+                        // B3 safe mode: remember the target this window
+                        // opened with (matched by `tabId`, never the live
+                        // `active` flag) so later closes and listings
+                        // touch only this lease's own tab. Scoped mode
+                        // needs none: its `tab list` is already owned-only.
+                        if !self.is_scoped() {
+                            let bound = self.bound_target_for(&session, &tab_id, deadline).await;
+                            self.inner
+                                .state
+                                .lock()
+                                .await
+                                .set_bound_target(&session, bound);
+                        }
                         return Ok((session, window_new));
                     }
                     Err(e) => {
@@ -732,9 +764,18 @@ impl Helper {
         let deadline = started + exec::CALL_BUDGET;
         let (default_session, window_new) = self.acquire(agent, token, 1, deadline).await?;
         let owned = self.inner.state.lock().await.owned(&agent.agent_id);
-        let scoped = exec::scope_cli_args(&raw, &self.inner.cdp, &default_session, &owned)?;
+        // B3: safe mode refuses `tab` outright (upstream `tab list` shows
+        // the whole shared browser); scoped mode allows `tab list` (the
+        // fork scopes it to owned tabs).
+        let scoped_argv = exec::scope_cli_args(
+            &raw,
+            &self.inner.cdp,
+            &default_session,
+            &owned,
+            self.is_scoped(),
+        )?;
         let mut full = vec![self.inner.agent_browser.to_string_lossy().into_owned()];
-        full.extend(scoped);
+        full.extend(scoped_argv);
         let child_started = std::time::Instant::now();
         let text = self.run_session_raw(&full, deadline).await;
         let child = child_started.elapsed();
@@ -761,18 +802,48 @@ impl Helper {
     }
 
     /// Give a fresh lease its own window on the shared browser: one
-    /// agent-browser `window new`. The retry budget comes from the
-    /// caller's deadline: a connect-phase failure (N7) is retried once
-    /// with the remaining budget, so the retry never pushes a window
-    /// open past CALL_BUDGET.
+    /// agent-browser `window new`. Returns the new tab id
+    /// (`{"tabId": "t9", …}`) so safe mode can bind the lease to the
+    /// target its window opened with (B3). The retry budget comes from
+    /// the caller's deadline: a connect-phase failure (N7) is retried
+    /// once with the remaining budget, so the retry never pushes a
+    /// window open past CALL_BUDGET.
     async fn open_window(
         &self,
         session: &str,
         deadline: std::time::Instant,
-    ) -> Result<(), HooError> {
+    ) -> Result<String, HooError> {
         let argv = self.session_argv(session, &["window", "new"]);
-        self.run_session_command(&argv, deadline).await?;
-        Ok(())
+        let data = self.run_session_command(&argv, deadline).await?;
+        Ok(data
+            .get("tabId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    /// The DevTools target the lease's window opened with (B3 safe mode):
+    /// match the `window new` tab id against a fresh `tab list`. Best
+    /// effort — a failure leaves the bound target unset and safe closes
+    /// skip the DevTools step rather than guess.
+    async fn bound_target_for(
+        &self,
+        session: &str,
+        tab_id: &str,
+        deadline: std::time::Instant,
+    ) -> Option<String> {
+        if tab_id.is_empty() {
+            return None;
+        }
+        let argv = self.session_argv(session, &["tab", "list"]);
+        let data = self.run_session_command(&argv, deadline).await.ok()?;
+        data.get("tabs")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|tab| tab.get("tabId").and_then(Value::as_str) == Some(tab_id))
+            .and_then(|tab| tab.get("targetId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
     }
 
     async fn run_screenshot(
@@ -894,9 +965,27 @@ impl Helper {
                     let result = self.run_session_command(&argv, deadline).await;
                     child += call_started.elapsed();
                     match result {
-                        Ok(data) => tabs.push(
-                            serde_json::json!({"session": session, "tabs": data.get("tabs")}),
-                        ),
+                        Ok(data) => {
+                            // B3: scoped mode passes the list through (the
+                            // fork scopes `--pin-tab` sessions to their
+                            // owned tabs). Safe mode returns only this
+                            // lease's own bound entry — never other
+                            // agents' URLs.
+                            let listed = if self.is_scoped() {
+                                data.get("tabs").cloned().unwrap_or(Value::Null)
+                            } else {
+                                let bound = self
+                                    .inner
+                                    .state
+                                    .lock()
+                                    .await
+                                    .leases
+                                    .get(&session)
+                                    .and_then(|lease| lease.bound_target.clone());
+                                bound_tab_entry(&data, bound.as_deref())
+                            };
+                            tabs.push(serde_json::json!({"session": session, "tabs": listed}));
+                        }
                         Err(e) => {
                             tabs.push(
                                 serde_json::json!({"session": session, "error": e.to_string()}),
@@ -915,28 +1004,14 @@ impl Helper {
                     .await
                     .resolve(&agent.agent_id, tab)?;
                 // H4: `tab close` refuses the last tab over `--cdp` and
-                // `close` only disconnects, so close the lease's bound tab
-                // via the DevTools HTTP endpoint first, then `close` the
-                // session. Only the `active` (bound) tab is closed: the
-                // session's list shows the whole shared browser, so closing
-                // every listed target would take other leases' pages with
-                // it. The DevTools close is the helper's own localhost
-                // HTTP, not child time. The list phase is capped well under
-                // the call budget so a wedged daemon cannot eat the `close`
-                // itself: a failed list just skips the DevTools step.
-                if let Ok(list_timeout) = exec::spawn_timeout(deadline) {
-                    let list_timeout = list_timeout.min(std::time::Duration::from_secs(15));
+                // `close` only disconnects, so close the lease's DevTools
+                // targets first, then `close` the session. The DevTools
+                // closes are the helper's own localhost HTTP, not child
+                // time; the list phase is capped well under the call
+                // budget so a wedged daemon cannot eat the `close` itself.
+                if exec::spawn_timeout(deadline).is_ok() {
                     let list_started = std::time::Instant::now();
-                    let list = self.session_argv(&session, &["tab", "list"]);
-                    if let Ok(data) =
-                        exec::run_command(&list, list_timeout, &self.inner.sock_dir).await
-                    {
-                        if let Some(target) = lease_bound_target(&data) {
-                            if let Some(authority) = cdp_authority(&self.inner.cdp) {
-                                devtools_close_target(&authority, &target).await;
-                            }
-                        }
-                    }
+                    self.close_lease_targets(&session).await;
                     child += list_started.elapsed();
                 }
                 let argv = exec::tool_argv(
@@ -1000,29 +1075,59 @@ impl Helper {
         })
     }
 
+    /// Best-effort DevTools close of a lease's targets (H4: over `--cdp`
+    /// agent-browser's `tab close` refuses the last tab and `close` only
+    /// disconnects the session, so neither removes the lease's pages from
+    /// the shared browser).
+    ///
+    /// B3: scoped mode closes every target in the lease's `tab list` (the
+    /// fork scopes `--pin-tab` sessions to their owned tabs: bound,
+    /// opened, adopted popups). Safe mode closes only the bound target
+    /// recorded at window open — never the live `active` flag, which may
+    /// belong to another lease — and skips the step when it is unknown.
+    /// A failed list just skips the DevTools step.
+    async fn close_lease_targets(&self, session: &str) {
+        let list = self.session_argv(session, &["tab", "list"]);
+        let timeout = exec::call_timeout().min(std::time::Duration::from_secs(15));
+        let Ok(data) = exec::run_command(&list, timeout, &self.inner.sock_dir).await else {
+            return;
+        };
+        let targets: Vec<String> = if self.is_scoped() {
+            lease_targets(&data)
+        } else {
+            self.inner
+                .state
+                .lock()
+                .await
+                .leases
+                .get(session)
+                .and_then(|lease| lease.bound_target.clone())
+                .into_iter()
+                .collect()
+        };
+        let Some(authority) = cdp_authority(&self.inner.cdp) else {
+            return;
+        };
+        for target in targets {
+            devtools_close_target(&authority, &target).await;
+        }
+    }
+
     /// Close one agent-browser session, best effort (sweeper/agentEnded).
     ///
     /// Over `--cdp` `tab close` refuses the last tab and `close` only
     /// disconnects the session, so neither removes the lease's page from
-    /// the shared browser (H4). Close the lease's bound tab through the
+    /// the shared browser (H4). Close the lease's targets through the
     /// DevTools HTTP endpoint on the helper's own Chromium, then `close`
     /// the session itself.
     async fn close_session(&self, session: &str) {
         // H4: over `--cdp` agent-browser's `tab close` refuses the last
         // tab and `close` only disconnects the session, so neither removes
-        // the lease's pages from the shared browser. List the lease's own
-        // targets and close each through the DevTools HTTP endpoint on the
-        // helper's own Chromium (`GET /json/close/<targetId>`), then
-        // `close` the session itself. All best effort: the process exits.
-        let list = self.session_argv(session, &["tab", "list"]);
-        if let Ok(data) = exec::run_command(&list, exec::call_timeout(), &self.inner.sock_dir).await
-        {
-            if let Some(target) = lease_bound_target(&data) {
-                if let Some(authority) = cdp_authority(&self.inner.cdp) {
-                    devtools_close_target(&authority, &target).await;
-                }
-            }
-        }
+        // the lease's pages from the shared browser. Close the lease's
+        // targets through the DevTools HTTP endpoint on the helper's own
+        // Chromium (`GET /json/close/<targetId>`), then `close` the
+        // session itself. All best effort: the process exits.
+        self.close_lease_targets(session).await;
         let close = self.session_argv(session, &["close"]);
         let _ = exec::run_command(&close, exec::call_timeout(), &self.inner.sock_dir).await;
     }
@@ -1042,19 +1147,42 @@ fn cdp_authority(cdp: &str) -> Option<String> {
     Some(authority.to_owned())
 }
 
-/// The lease's bound tab from a `tab list --json` envelope: the entry the
-/// session marks `active` is the tab agent-browser runs the session on
-/// (probed: each session's list shows the whole shared browser, but exactly
-/// its own tab is active). Only that target is provably the lease's, so
-/// only it is closed here — never another lease's pages.
-fn lease_bound_target(data: &Value) -> Option<String> {
-    data.get("tabs").and_then(Value::as_array).and_then(|tabs| {
-        tabs.iter()
-            .filter(|tab| tab.get("active").and_then(Value::as_bool).unwrap_or(false))
-            .filter_map(|tab| tab.get("targetId").and_then(Value::as_str))
-            .map(str::to_owned)
-            .next()
-    })
+/// Every target in a `tab list --json` envelope (B3 scoped mode): the
+/// fork scopes `--pin-tab` sessions' lists to their owned tabs (bound,
+/// opened, adopted popups), so closing all of them touches only the
+/// lease's own pages.
+fn lease_targets(data: &Value) -> Vec<String> {
+    data.get("tabs")
+        .and_then(Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|tab| {
+                    tab.get("targetId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The lease's own entry in a `tab list --json` envelope (B3 safe mode):
+/// the entry whose target matches the bound id recorded at window open.
+/// Anything else belongs to another lease and must not leak into safe
+/// listings. Unknown bound (or no match) yields an empty list rather
+/// than someone else's URL.
+fn bound_tab_entry(data: &Value, bound: Option<&str>) -> Value {
+    let entry = bound.and_then(|target| {
+        data.get("tabs")?
+            .as_array()?
+            .iter()
+            .find(|tab| tab.get("targetId").and_then(Value::as_str) == Some(target))
+            .cloned()
+    });
+    match entry {
+        Some(tab) => Value::Array(vec![tab]),
+        None => Value::Array(vec![]),
+    }
 }
 
 /// Close one page target through the DevTools HTTP endpoint (H4):
@@ -1389,22 +1517,42 @@ mod tests {
     }
 
     #[test]
-    fn lease_bound_target_is_the_active_tab() {
-        // The session's list shows the whole shared browser; exactly its
-        // own (bound) tab is active, and only that target may be closed.
+    fn scoped_close_takes_every_listed_target() {
+        // Scoped mode (fork): the list is already owned-only, so every
+        // target closes — the `active` flag is irrelevant.
         let data = serde_json::json!({"tabs": [
             {"tabId": "t1", "targetId": "AAA", "active": false},
             {"tabId": "t2", "targetId": "BBB", "active": true},
             {"tabId": "t3", "targetId": "CCC"},
         ]});
-        assert_eq!(lease_bound_target(&data).as_deref(), Some("BBB"));
-        assert_eq!(lease_bound_target(&serde_json::json!({"tabs": []})), None);
-        assert_eq!(lease_bound_target(&serde_json::json!({})), None);
-        // No active tab (a gone binding): nothing to close.
+        assert_eq!(lease_targets(&data), vec!["AAA", "BBB", "CCC"]);
+        assert!(lease_targets(&serde_json::json!({"tabs": []})).is_empty());
+        assert!(lease_targets(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn safe_listing_shows_only_the_bound_entry() {
+        // Safe mode (upstream): the list shows the whole shared browser,
+        // so listings keep only the bound target's entry — never other
+        // agents' URLs — and the `active` flag is ignored.
         let data = serde_json::json!({"tabs": [
-            {"tabId": "t1", "targetId": "AAA", "active": false},
+            {"tabId": "t9", "targetId": "OWN", "active": false, "url": "https://own.example/"},
+            {"tabId": "t1", "targetId": "OTHER", "active": true, "url": "https://other.example/"},
         ]});
-        assert_eq!(lease_bound_target(&data), None);
+        let listed = bound_tab_entry(&data, Some("OWN"));
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                {"tabId": "t9", "targetId": "OWN", "active": false, "url": "https://own.example/"},
+            ])
+        );
+        // Unknown bound (or no match): empty, never someone else's tabs.
+        assert_eq!(bound_tab_entry(&data, None), serde_json::json!([]));
+        assert_eq!(bound_tab_entry(&data, Some("GONE")), serde_json::json!([]));
+        assert_eq!(
+            bound_tab_entry(&serde_json::json!({}), Some("OWN")),
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
