@@ -83,24 +83,88 @@ async fn connect(socket: &Path, token: &str) -> TestPeer {
         .unwrap_or_else(|e| panic!("MCP handshake failed: {e}"))
 }
 
-async fn notify_started(peer: &TestPeer, agent_id: &str, parent_id: &str, token: &str) {
+/// Poll the helper's token map instead of sleeping a fixed delay after
+/// a notification: notifications are handled asynchronously, so a sleep
+/// either flakes or wastes time.
+async fn wait_registered(helper: &Helper, token: &str) {
+    for _ in 0..150 {
+        if helper.agent_for(token).await.is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("token {token} was never registered");
+}
+
+async fn wait_unknown(helper: &Helper, token: &str) {
+    for _ in 0..150 {
+        if helper.agent_for(token).await.is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("token {token} is still known");
+}
+
+async fn notify_started(
+    helper: &Helper,
+    peer: &TestPeer,
+    agent_id: &str,
+    parent_id: &str,
+    depth: u64,
+    token: &str,
+) {
     peer.send_notification(rmcp::model::ClientNotification::CustomNotification(
         CustomNotification::new(
             "hoocode/agentStarted".to_owned(),
             Some(serde_json::json!({
                 "agentId": agent_id,
                 "parentId": parent_id,
-                "depth": 1,
+                "depth": depth,
                 "token": token,
             })),
         ),
     ))
     .await
     .expect("agentStarted");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_registered(helper, token).await;
 }
 
-async fn notify_ended(peer: &TestPeer, agent_id: &str) {
+async fn notify_started_child(helper: &Helper, peer: &TestPeer, agent_id: &str, token: &str) {
+    notify_started(helper, peer, agent_id, "root", 1, token).await;
+}
+
+/// Send `agentStarted` without waiting: for refused registrations the token
+/// never appears, so the caller polls for continued absence instead.
+async fn send_started(peer: &TestPeer, agent_id: &str, parent_id: &str, depth: u64, token: &str) {
+    peer.send_notification(rmcp::model::ClientNotification::CustomNotification(
+        CustomNotification::new(
+            "hoocode/agentStarted".to_owned(),
+            Some(serde_json::json!({
+                "agentId": agent_id,
+                "parentId": parent_id,
+                "depth": depth,
+                "token": token,
+            })),
+        ),
+    ))
+    .await
+    .expect("agentStarted");
+}
+
+/// A refused registration must never surface the token (polled absence:
+/// there is no event to wait for).
+async fn assert_still_unknown(helper: &Helper, token: &str) {
+    for _ in 0..15 {
+        assert!(
+            helper.agent_for(token).await.is_none(),
+            "token {token} must stay unknown"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn notify_ended(helper: &Helper, peer: &TestPeer, agent_id: &str, token: &str) {
     peer.send_notification(rmcp::model::ClientNotification::CustomNotification(
         CustomNotification::new(
             "hoocode/agentEnded".to_owned(),
@@ -109,7 +173,7 @@ async fn notify_ended(peer: &TestPeer, agent_id: &str) {
     ))
     .await
     .expect("agentEnded");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_unknown(helper, token).await;
 }
 
 async fn call(
@@ -302,11 +366,11 @@ fn base64_decode(data: &str) -> Vec<u8> {
 #[tokio::test]
 async fn fake_parallel_agents_cross_agent_refused_and_lifecycle() {
     let dir = test_tmp("agents");
-    let (_helper, socket) =
+    let (helper, socket) =
         start_helper(&manifest_dir().join("tests/fake-agent-browser.sh"), &dir).await;
     let root = connect(&socket, ROOT_TOKEN).await;
-    notify_started(&root, "root/task-1", "root", "child-1-token").await;
-    notify_started(&root, "root/task-2", "root", "child-2-token").await;
+    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
+    notify_started_child(&helper, &root, "root/task-2", "child-2-token").await;
     let child1 = connect(&socket, "child-1-token").await;
     let child2 = connect(&socket, "child-2-token").await;
 
@@ -347,12 +411,13 @@ async fn fake_parallel_agents_cross_agent_refused_and_lifecycle() {
     );
 
     // A non-child registration is ignored: the token never becomes known.
-    notify_started(&child1, "root/task-9", "root", "rogue-token").await;
+    send_started(&child1, "root/task-9", "root", 1, "rogue-token").await;
+    assert_still_unknown(&helper, "rogue-token").await;
     let rogue = try_connect(&socket, "rogue-token").await;
     assert!(rogue.is_err(), "rogue token must be unknown: {rogue:?}");
 
     // agentEnded closes that agent's sessions and drops its token.
-    notify_ended(&root, "root/task-2").await;
+    notify_ended(&helper, &root, "root/task-2", "child-2-token").await;
     let ended_call = call(&child2, "browser_snapshot", serde_json::json!({})).await;
     assert!(
         ended_call.is_err(),
@@ -373,7 +438,7 @@ async fn fake_parallel_agents_cross_agent_refused_and_lifecycle() {
     .await
     .expect("adopt");
     assert!(!is_error(&adopt), "adopt failed: {}", text_of(&adopt));
-    notify_ended(&root, "root/task-1").await;
+    notify_ended(&helper, &root, "root/task-1", "child-1-token").await;
     let list = call(&root, "browser_tabs", serde_json::json!({"action": "list"}))
         .await
         .expect("list");
@@ -383,6 +448,251 @@ async fn fake_parallel_agents_cross_agent_refused_and_lifecycle() {
         "adopted lease must survive: {}",
         text_of(&list)
     );
+}
+
+/// Wrapper around the fake so each test gets its own argv log and fail
+/// file (process env is shared by parallel tests, files are not).
+fn fake_wrapper(dir: &Path, argv_log: &Path, fail_file: Option<&Path>) -> PathBuf {
+    fn sh_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+    let path = dir.join("fake-wrapper.sh");
+    let mut script = format!(
+        "#!/bin/bash\nexport FAKE_ARGV_LOG={}\n",
+        sh_quote(argv_log)
+    );
+    if let Some(fail) = fail_file {
+        script.push_str(&format!("export FAKE_FAIL_FILE={}\n", sh_quote(fail)));
+    }
+    script.push_str(&format!(
+        "exec {} \"$@\"\n",
+        sh_quote(&manifest_dir().join("tests/fake-agent-browser.sh"))
+    ));
+    std::fs::write(&path, script).expect("wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    path
+}
+
+fn argv_lines(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn fake_every_call_carries_session_and_pin_tab() {
+    let dir = test_tmp("argv");
+    let argv_log = dir.join("argv.log");
+    let fake = fake_wrapper(&dir, &argv_log, None);
+    let (helper, socket) = start_helper(&fake, &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
+    let child = connect(&socket, "child-1-token").await;
+    call(&child, "browser_open", serde_json::json!({"url": "https://x.example/", "tab": 2}))
+        .await
+        .expect("open tab 2");
+    call(&child, "browser_snapshot", serde_json::json!({}))
+        .await
+        .expect("snapshot tab 1");
+    let cli = call(&child, "browser_cli", serde_json::json!({"args": ["snapshot"]}))
+        .await
+        .expect("cli");
+    assert!(!is_error(&cli));
+    let lines = argv_lines(&argv_log);
+    // open tab 2 (window new + open), snapshot tab 1, cli snapshot (window
+    // new for the default lease + snapshot): every spawn is scoped.
+    assert!(lines.len() >= 5, "expected several recorded calls, got {lines:?}");
+    for line in &lines {
+        assert!(line.contains("--pin-tab"), "leases pin their tab: {line}");
+        assert!(
+            line.contains("--cdp ws://fake-endpoint-for-tests"),
+            "shared browser is not optional: {line}"
+        );
+    }
+    let tab1: Vec<&String> = lines.iter().filter(|l| l.contains("root_task-1-1")).collect();
+    let tab2: Vec<&String> = lines.iter().filter(|l| l.contains("root_task-1-2")).collect();
+    assert!(!tab1.is_empty() && !tab2.is_empty(), "both tabs used: {lines:?}");
+    assert!(
+        lines.iter().all(|l| l.contains("root_task-1-")),
+        "no call escapes the agent's leases: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn fake_window_new_failure_rolls_the_lease_back() {
+    let dir = test_tmp("rollback");
+    let argv_log = dir.join("argv.log");
+    let fail_file = dir.join("fail");
+    let fake = fake_wrapper(&dir, &argv_log, Some(&fail_file));
+    let (helper, socket) = start_helper(&fake, &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
+    let child = connect(&socket, "child-1-token").await;
+    call(&child, "browser_open", serde_json::json!({"url": "https://x.example/"}))
+        .await
+        .expect("open tab 1");
+    // Fail tab 2's window: the open errors and the lease is rolled back.
+    std::fs::write(&fail_file, "root_task-1-2\n").expect("fail file");
+    let bad = call(
+        &child,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/", "tab": 2}),
+    )
+    .await
+    .expect("protocol ok");
+    assert!(is_error(&bad), "window-new failure must surface: {}", text_of(&bad));
+    // No phantom tab: tab 3 is still out of reach, tab 1 is untouched.
+    let skip = call(&child, "browser_snapshot", serde_json::json!({"tab": 3}))
+        .await
+        .expect("protocol ok");
+    assert!(is_error(&skip), "tab 3 must not exist: {}", text_of(&skip));
+    let tab1 = call(&child, "browser_snapshot", serde_json::json!({}))
+        .await
+        .expect("tab 1 survives");
+    assert!(!is_error(&tab1));
+    // The failure lifted: tab 2 opens in the same slot.
+    std::fs::remove_file(&fail_file).expect("unfail");
+    let tab2 = call(
+        &child,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/", "tab": 2}),
+    )
+    .await
+    .expect("tab 2 reopens");
+    assert!(!is_error(&tab2), "tab 2 must reopen: {}", text_of(&tab2));
+}
+
+#[tokio::test]
+async fn fake_closing_a_tab_keeps_the_others() {
+    let dir = test_tmp("closekeep");
+    let (helper, socket) =
+        start_helper(&manifest_dir().join("tests/fake-agent-browser.sh"), &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
+    let child = connect(&socket, "child-1-token").await;
+    for tab in [1, 2] {
+        call(&child, "browser_open", serde_json::json!({"url": "https://x.example/", "tab": tab}))
+            .await
+            .expect("open");
+    }
+    let closed = call(&child, "browser_tabs", serde_json::json!({"action": "close", "tab": 1}))
+        .await
+        .expect("close tab 1");
+    assert!(!is_error(&closed), "close failed: {}", text_of(&closed));
+    // Tab 2 is unaffected (no renumbering); tab 1 reopens fresh.
+    let tab2 = call(&child, "browser_snapshot", serde_json::json!({"tab": 2}))
+        .await
+        .expect("tab 2");
+    assert!(!is_error(&tab2), "tab 2 must survive: {}", text_of(&tab2));
+    let reopened = call(&child, "browser_open", serde_json::json!({"url": "https://y.example/", "tab": 1}))
+        .await
+        .expect("reopen tab 1");
+    assert!(!is_error(&reopened), "tab 1 must reopen: {}", text_of(&reopened));
+}
+
+#[tokio::test]
+async fn fake_spawn_and_timeout_failures_are_tool_errors() {
+    // No such binary: the spawn fails and the model sees a tool error.
+    let dir = test_tmp("spawnfail");
+    let socket = dir.join("helper.sock");
+    let helper = Helper::new(
+        PathBuf::from("/nonexistent/agent-browser-for-tests"),
+        "ws://fake".into(),
+        dir.clone(),
+        hoo_browser::backend::socket_dir(&dir),
+        ROOT_TOKEN.into(),
+        "root".into(),
+    );
+    tokio::spawn(hoo_browser::server::serve(helper, socket.clone()));
+    wait_for_socket(&socket).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    let failed = call(&root, "browser_open", serde_json::json!({"url": "https://x.example/"}))
+        .await
+        .expect("protocol ok");
+    assert!(is_error(&failed), "spawn failure must be a tool error");
+    assert!(text_of(&failed).contains("cannot spawn"), "got: {}", text_of(&failed));
+
+    // A hanging agent-browser trips the per-call timeout (lowered for the
+    // test; concurrent fake calls take milliseconds, far under either).
+    let dir = test_tmp("timeout");
+    let argv_log = dir.join("argv.log");
+    let fake = fake_wrapper(&dir, &argv_log, None);
+    let (helper, socket) = start_helper(&fake, &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/slowpoke", "slow-token").await;
+    let slow = connect(&socket, "slow-token").await;
+    std::env::set_var("HOO_BROWSER_CALL_TIMEOUT_SECS", "1");
+    let timed = call(&slow, "browser_open", serde_json::json!({"url": "https://x.example/"}))
+        .await
+        .expect("protocol ok");
+    std::env::remove_var("HOO_BROWSER_CALL_TIMEOUT_SECS");
+    assert!(is_error(&timed), "timeout must be a tool error");
+    assert!(text_of(&timed).contains("timed out"), "got: {}", text_of(&timed));
+}
+
+/// Send `agentEnded` without waiting (ignored ones change nothing).
+async fn send_ended(peer: &TestPeer, agent_id: &str) {
+    peer.send_notification(rmcp::model::ClientNotification::CustomNotification(
+        CustomNotification::new(
+            "hoocode/agentEnded".to_owned(),
+            Some(serde_json::json!({ "agentId": agent_id })),
+        ),
+    ))
+    .await
+    .expect("agentEnded");
+    // Notifications are async: give the server a chance to (not) act.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+async fn send_session_ending(peer: &TestPeer) {
+    peer.send_notification(rmcp::model::ClientNotification::CustomNotification(
+        CustomNotification::new("hoocode/sessionEnding".to_owned(), None),
+    ))
+    .await
+    .expect("sessionEnding");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn fake_registration_scoping_and_ending_rules() {
+    let dir = test_tmp("rules");
+    let (helper, socket) =
+        start_helper(&manifest_dir().join("tests/fake-agent-browser.sh"), &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
+    // C1 over the wire: none of these nest under the sender correctly.
+    send_started(&root, "other/task-9", "root", 1, "rogue-a").await; // parent mismatch
+    send_started(&root, "root2/x", "root", 1, "rogue-b").await; // not under root/
+    send_started(&root, "root/task-1", "root", 1, "rogue-c").await; // taken id
+    send_started(&root, "root/task-9", "root", 2, "rogue-d").await; // depth skip
+    send_started(&root, "root/task-9", "root", 1, "child-1-token").await; // taken token
+    for token in ["rogue-a", "rogue-b", "rogue-c", "rogue-d"] {
+        assert_still_unknown(&helper, token).await;
+    }
+    assert_still_unknown(&helper, "child-1-token-reuse-never-exists").await;
+    // The reused token still maps to its original agent.
+    assert!(helper.agent_for("child-1-token").await.is_some());
+    // H1: a sibling cannot end another agent, nor itself, and a non-root
+    // sessionEnding is noise.
+    let child = connect(&socket, "child-1-token").await;
+    send_ended(&child, "root").await;
+    send_ended(&child, "root/task-1").await;
+    send_session_ending(&child).await;
+    let root_list = call(&root, "browser_tabs", serde_json::json!({"action": "list"}))
+        .await
+        .expect("root survives sibling ends");
+    assert!(!is_error(&root_list));
+    let child_snap = call(&child, "browser_snapshot", serde_json::json!({}))
+        .await
+        .expect("child survives self end");
+    assert!(!is_error(&child_snap));
 }
 
 #[tokio::test]
@@ -524,6 +834,36 @@ fn ref_for(result_text: &str, label: &str) -> Option<String> {
     None
 }
 
+/// Page targets on the shared browser via the DevTools HTTP endpoint.
+async fn cdp_page_targets(endpoint: &str) -> usize {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let bare = endpoint
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://");
+    let host_port = bare.split('/').next().unwrap_or("").to_owned();
+    let mut stream = tokio::net::TcpStream::connect(&host_port)
+        .await
+        .expect("cdp http");
+    let request = format!(
+        "GET /json/list HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).await.expect("read");
+    let text = String::from_utf8_lossy(&body);
+    let json_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    serde_json::from_str::<Value>(&text[json_start..])
+        .ok()
+        .and_then(|targets| targets.as_array().cloned())
+        .map(|targets| {
+            targets
+                .iter()
+                .filter(|t| t.get("type") == Some(&Value::String("page".into())))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn real_no_steal_suite() {
     let Some(agent_browser) = real_backend() else {
@@ -545,16 +885,17 @@ async fn real_no_steal_suite() {
     );
     let socket = dir.join("helper.sock");
     let _ = std::fs::remove_file(&socket);
-    tokio::spawn(hoo_browser::server::serve(helper, socket.clone()));
+    tokio::spawn(hoo_browser::server::serve(helper.clone(), socket.clone()));
     wait_for_socket(&socket).await;
+    let endpoint = chromium.endpoint.clone();
     // Chromium dies with the test process (kill_on_drop in the handle).
     let _chromium = chromium;
 
     let (page, _page_server) = start_test_page().await;
     let root = connect(&socket, ROOT_TOKEN).await;
-    notify_started(&root, "root/task-1", "root", "child-1-token").await;
-    notify_started(&root, "root/task-2", "root", "child-2-token").await;
-    notify_started(&root, "root/task-3", "root", "child-3-token").await;
+    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
+    notify_started_child(&helper, &root, "root/task-2", "child-2-token").await;
+    notify_started_child(&helper, &root, "root/task-3", "child-3-token").await;
     let children = [
         connect(&socket, "child-1-token").await,
         connect(&socket, "child-2-token").await,
@@ -671,7 +1012,15 @@ async fn real_no_steal_suite() {
                     }
                 }
                 let snap = call(&peer, "browser_snapshot", serde_json::json!({"tab": tab})).await;
-                (i, tab, opened, snap)
+                // location.href proves the tab really is this agent's page:
+                // a shared or stolen session would show another query.
+                let href = call(
+                    &peer,
+                    "browser_eval",
+                    serde_json::json!({"js": "location.href", "tab": tab}),
+                )
+                .await;
+                (i, tab, opened, snap, href)
             }));
         }
     }
@@ -679,7 +1028,7 @@ async fn real_no_steal_suite() {
     for task in tasks {
         results.push(task.await.expect("parallel task"));
     }
-    for (i, tab, opened, snap) in results {
+    for (i, tab, opened, snap, href) in results {
         let opened = opened.expect("parallel open");
         assert!(
             !is_error(&opened),
@@ -696,6 +1045,18 @@ async fn real_no_steal_suite() {
             text_of(&snap).contains("page one"),
             "agent {i} tab {tab} sees its own page"
         );
+        let href = href.expect("parallel href");
+        assert!(
+            !is_error(&href),
+            "agent {i} tab {tab} href failed: {}",
+            text_of(&href)
+        );
+        let want = format!("agent={i}&tab={tab}");
+        assert!(
+            text_of(&href).contains(&want),
+            "agent {i} tab {tab} must be on its own page (?{want}), got: {}",
+            text_of(&href)
+        );
     }
 
     // Cross-agent access is refused over the CLI fallback too.
@@ -707,10 +1068,25 @@ async fn real_no_steal_suite() {
     .await;
     assert!(cross.is_err(), "cross-agent CLI must be refused: {cross:?}");
 
-    // agentEnded closes that agent's sessions.
-    notify_ended(&root, "root/task-3").await;
+    // agentEnded closes that agent's sessions and windows: the DevTools
+    // /json endpoint must lose at least its two page targets.
+    let pages_before = cdp_page_targets(&endpoint).await;
+    assert!(pages_before >= 7, "leases must own pages: {pages_before}");
+    notify_ended(&helper, &root, "root/task-3", "child-3-token").await;
     let ended = call(&children[2], "browser_snapshot", serde_json::json!({})).await;
     assert!(ended.is_err(), "ended agent must be unknown: {ended:?}");
+    let mut pages_after = pages_before;
+    for _ in 0..50 {
+        pages_after = cdp_page_targets(&endpoint).await;
+        if pages_after + 2 <= pages_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        pages_after + 2 <= pages_before,
+        "agentEnded must close windows too: {pages_after} vs {pages_before} page targets"
+    );
 
     report_overheads(&dir);
     // Chromium is killed by `_chromium` drop at test end.
