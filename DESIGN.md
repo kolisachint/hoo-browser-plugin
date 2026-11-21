@@ -42,9 +42,19 @@ p95; the real integration suite prints p50/p95.
 work; `chrome` (real Chrome via the 144+ toggle) and `lightpanda` return
 "not yet supported" (B4). Chromium resolves from `HOO_BROWSER_CHROME`, else
 agent-browser's own install, else common paths. agent-browser resolves from
-`HOO_BROWSER_AGENT_BROWSER`, else the pinned data-dir file, else `PATH`; the
-pinned download stays unwired until the fork release with AB-1..AB-4 exists
-(TODO in `backend.rs`).
+`HOO_BROWSER_AGENT_BROWSER` (use this for a local fork build with AB-1..AB-4
+until the first fork release), else the pinned data-dir file, else `PATH`;
+the pinned download stays unwired until that release (TODO in `backend.rs`).
+
+Chromium runs in its own process group so shutdown kills the whole tree;
+the DevTools port is `--remote-debugging-port=0` (a loopback-only,
+unauthenticated endpoint — the helper passes it to its own children over the
+command line, never over the network). The agent-browser daemon dir lives in
+the per-session runtime dir (the helper socket's parent, 0700, removed by
+hoocode at session end; cleaned at startup). The browser profile is
+`PLUGIN_DATA/profile` behind a lock file; a second live helper falls back to
+a fresh profile in its runtime dir. Every lease carries `--pin-tab` so its
+background window never takes focus (upstream AB-1).
 
 ## Later (from the old chromiumoxide driver; not committed scope)
 

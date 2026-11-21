@@ -58,13 +58,14 @@ impl Backend {
     }
 }
 
-/// Pinned agent-browser release (spec B3). Until the fork
-/// (`kolisachint/agent-browser`) has a release with AB-1..AB-4, the pin points
-/// at the upstream release; asset names below must be confirmed against that
-/// release before the download path is wired, so auto-download stays off and
-/// the helper reports exactly where to put the binary.
+/// Pinned agent-browser release (spec B3). The pin points at the fork
+/// (`kolisachint/agent-browser`); the fork has no release with AB-1..AB-4
+/// yet, so the download stays unwired and the helper reports exactly where
+/// to put the binary.
 ///
-/// TODO(B3): confirm upstream asset names, fill `sha256`, wire download.
+/// TODO(B3): cut the first fork release, fill `sha256` below from its
+/// assets, wire the download. Until then use a local build via
+/// `HOO_BROWSER_AGENT_BROWSER` (see README).
 #[allow(dead_code)]
 pub struct AgentBrowserPin {
     pub platform: &'static str,
@@ -72,28 +73,28 @@ pub struct AgentBrowserPin {
     pub sha256: &'static str,
 }
 
-/// TODO(B3): placeholder URLs until the fork release exists.
-pub const AGENT_BROWSER_PIN_TAG: &str = "upstream-latest";
+/// TODO(B3): placeholder URLs until the first fork release exists.
+pub const AGENT_BROWSER_PIN_TAG: &str = "fork-first-release";
 #[allow(dead_code)]
 pub const AGENT_BROWSER_PINS: &[AgentBrowserPin] = &[
     AgentBrowserPin {
         platform: "linux-x86_64",
-        url: "https://github.com/vercel-labs/agent-browser/releases/latest/download/agent-browser-linux-x86_64",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-linux-x86_64",
         sha256: "TODO",
     },
     AgentBrowserPin {
         platform: "linux-aarch64",
-        url: "https://github.com/vercel-labs/agent-browser/releases/latest/download/agent-browser-linux-aarch64",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-linux-aarch64",
         sha256: "TODO",
     },
     AgentBrowserPin {
         platform: "darwin-aarch64",
-        url: "https://github.com/vercel-labs/agent-browser/releases/latest/download/agent-browser-darwin-aarch64",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-darwin-aarch64",
         sha256: "TODO",
     },
     AgentBrowserPin {
         platform: "darwin-x86_64",
-        url: "https://github.com/vercel-labs/agent-browser/releases/latest/download/agent-browser-darwin-x86_64",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-darwin-x86_64",
         sha256: "TODO",
     },
 ];

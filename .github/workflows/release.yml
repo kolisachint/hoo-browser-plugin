@@ -1,14 +1,28 @@
 name: release
 
-# On tag v*: build the four platform binaries as plain files (hoocode refuses
-# archives), upload them to the release, and print the sha256s so the manifest
-# PR can pin them via scripts/update_manifest.py.
+# On tag v*: create the release, build the four platform binaries as plain
+# files (hoocode refuses archives), upload them, then open a PR pinning their
+# sha256s into plugin/plugin.json via scripts/update_manifest.py.
+
+permissions:
+  contents: write
+  pull-requests: write
+
 on:
   push:
     tags: ["v*"]
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "hoo-browser $GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build:
+    needs: create-release
     strategy:
       matrix:
         include:
@@ -26,12 +40,12 @@ jobs:
             platform: darwin-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: "1.100.0"
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: cross toolchain (linux-aarch64)
         if: matrix.platform == 'linux-aarch64'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -41,9 +55,40 @@ jobs:
       - name: stage plain binary
         run: cp target/${{ matrix.target }}/release/hoo-browser hoo-browser-${{ matrix.platform }}
       - name: print sha256
-        run: sha256sum hoo-browser-${{ matrix.platform }}
+        # macOS runners have no sha256sum; shasum is the same SHA-256.
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            shasum -a 256 hoo-browser-${{ matrix.platform }}
+          else
+            sha256sum hoo-browser-${{ matrix.platform }}
+          fi
       - name: upload
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: hoo-browser-${{ matrix.platform }}
           fail_on_unmatched_files: true
+
+  manifest-pr:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: pin release sha256s into plugin/plugin.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 scripts/update_manifest.py --version "$VERSION" --from-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: open manifest PR
+        run: |
+          BRANCH="release/manifest-$GITHUB_REF_NAME"
+          git checkout -b "$BRANCH"
+          git add plugin/plugin.json
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+            commit -m "pin $GITHUB_REF_NAME sha256s into plugin/plugin.json"
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "pin $GITHUB_REF_NAME sha256s into plugin/plugin.json" \
+            --body "Automated manifest pin for $GITHUB_REF_NAME (see scripts/update_manifest.py)."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

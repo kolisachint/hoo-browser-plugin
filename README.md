@@ -15,7 +15,10 @@ Needs Rust 1.100 (rust-toolchain pins it if present). No Chromium or
 agent-browser needed to build; both resolve at runtime:
 
 - agent-browser CLI: `HOO_BROWSER_AGENT_BROWSER` env, else the pinned file in
-  the data dir, else `PATH`.
+  the data dir, else `PATH`. To use a local build (e.g. the fork with the
+  AB-1..AB-4 fixes before its first release), point `HOO_BROWSER_AGENT_BROWSER`
+  at the built binary — this is the supported route until the pinned fork
+  release exists (see `backend.rs`).
 - Chromium: `HOO_BROWSER_CHROME` env, else agent-browser's own install
   (`~/.agent-browser/browsers/`), else common install paths.
 
@@ -57,6 +60,20 @@ hoo-browser --session root_task-1-1 eval "document.title"
 ```
 
 Per-call overhead lines go to `<data dir>/hoo-browser.log` (debug level;
-never tokens). Backend selection: `HOO_BROWSER_BACKEND` (`chromium-headless`
-default, `chromium-headed`; `chrome` and `lightpanda` return "not yet
-supported", B4) or `HOO_BROWSER_HEADED=1`.
+never tokens); `scripts/overhead.py` prints helper-only vs spawn+connect
+p50/p95 from that log. Backend selection: `HOO_BROWSER_BACKEND`
+(`chromium-headless` default, `chromium-headed`; `chrome` and `lightpanda`
+return "not yet supported", B4) or `HOO_BROWSER_HEADED=1`.
+
+## Release
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The release workflow builds the four platform binaries, uploads them, then
+opens a PR pinning their sha256s into `plugin/plugin.json` — merge that PR
+before anything else references the tag. Only after the release exists (assets
+uploaded, manifest PR merged) add the `hoo-browser` entry to hoo-plugins
+(git-subdir, path `plugin`): the marketplace pins the tag, and a listing
+merged earlier would resolve URLs and sha256s that do not exist yet.

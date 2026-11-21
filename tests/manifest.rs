@@ -1,9 +1,14 @@
 //! `plugin/plugin.json` validation against hoocode's tier C native rules.
 //!
-//! Reimplements the checks of hoocode's `crates/hoocode-code-plugins/src/native.rs`
-//! (field names, platform keys, https URLs, 64-hex sha256, tool name rules,
-//! inputSchema object with `type: object`, permission hints) plus the identity
-//! between the manifest schemas and the schemas served by `tools/list`.
+//! Source of truth: hoocode's `crates/hoocode-code-plugins/src/native.rs`.
+//! That check lives inside the hoocode binary, which exposes no manifest-
+//! validation subcommand (`hoocode --version` here is 0.2.50 and offers no
+//! such entry point), so invoking it is not feasible and this file
+//! reimplements its checks instead (field names, platform keys, https URLs,
+//! 64-hex sha256, tool name rules, inputSchema object with `type: object`,
+//! permission hints) plus the identity between the manifest schemas and the
+//! schemas served by `tools/list`. If hoocode ever gains a validation
+//! command, prefer calling it over extending this reimplementation.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
