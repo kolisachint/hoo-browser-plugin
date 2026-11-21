@@ -949,7 +949,8 @@ async fn cdp_page_targets(endpoint: &str) -> usize {
             .lines()
             .filter_map(|line| {
                 let (name, value) = line.split_once(':')?;
-                (name.trim().to_ascii_lowercase() == "content-length")
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
                     .then(|| value.trim().parse().ok())
             })
             .next()
