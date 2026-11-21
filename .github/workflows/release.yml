@@ -1,162 +1,191 @@
-name: Release
+name: release
 
-on:
-  pull_request:
-    types: [closed]
+# Label-driven: when a PR carrying cargo:patch|cargo:minor|cargo:major is
+# merged, bump the version, build the four platform binaries as plain files
+# (hoocode refuses archives), pin their sha256s into plugin/plugin.json,
+# commit that on main, tag, and release. Merge -> release -> live with no
+# manual steps. workflow_dispatch (input: bump) is the manual retry route.
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the version to bump"
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+
 jobs:
-  # ── 1. Bump version, commit, push, annotated tag ──────────────────────
-  bump-and-tag:
+  # ── 1. Decide the bump and compute the next version from Cargo.toml ────
+  version:
+    # Property access on a missing pull_request yields null (no error), so
+    # this stays safe on workflow_dispatch; the label check itself lives in
+    # the gate step, where toJSON(null) renders as "null" without failing.
     if: >
-      github.event.pull_request.merged == true && (
-        contains(github.event.pull_request.labels.*.name, 'cargo:patch') ||
-        contains(github.event.pull_request.labels.*.name, 'cargo:minor') ||
-        contains(github.event.pull_request.labels.*.name, 'cargo:major')
-      )
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
-      tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Configure Git
+      - name: gate on cargo label, pick bump type
+        id: kind
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "github-actions@github.com"
-
-      - name: Determine release type from label
-        id: release-type
-        run: |
-          if ${{ contains(github.event.pull_request.labels.*.name, 'cargo:major') }}; then
-            echo "type=major" >> "$GITHUB_OUTPUT"
-          elif ${{ contains(github.event.pull_request.labels.*.name, 'cargo:minor') }}; then
-            echo "type=minor" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "type=${{ inputs.bump }}" >> "$GITHUB_OUTPUT"
           else
-            echo "type=patch" >> "$GITHUB_OUTPUT"
+            case '${{ toJSON(github.event.pull_request.labels.*.name) }}' in
+              *cargo:major*) echo "type=major" >> "$GITHUB_OUTPUT" ;;
+              *cargo:minor*) echo "type=minor" >> "$GITHUB_OUTPUT" ;;
+              *cargo:patch*) echo "type=patch" >> "$GITHUB_OUTPUT" ;;
+              *) echo "type=none" >> "$GITHUB_OUTPUT" ;;
+            esac
           fi
 
-      - name: Bump version in Cargo.toml
+      - name: compute next version
         id: bump
+        if: steps.kind.outputs.type != 'none'
         run: |
           CURRENT_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "Current version: $CURRENT_VERSION"
-
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
-
-          BUMP_TYPE="${{ steps.release-type.outputs.type }}"
-          case "$BUMP_TYPE" in
+          case "${{ steps.kind.outputs.type }}" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
           esac
-
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "New version: $NEW_VERSION"
-
-          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" Cargo.toml
-
-          cargo update
-
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and tag
-        run: |
-          VERSION="${{ steps.bump.outputs.version }}"
-          git add Cargo.toml Cargo.lock
-          git commit -m "release: v${VERSION}"
-          git tag -a "v${VERSION}" -m "release: v${VERSION}"
-
-      - name: Push version bump and tag
-        run: git push --follow-tags origin main
-
-  # ── 2. Create the GitHub release ──────────────────────────────────────
-  create-release:
-    name: Create GitHub release
-    needs: [bump-and-tag]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="${{ needs.bump-and-tag.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag already exists"
-          else
-            gh release create "$tag" --title "$tag" --generate-notes
-          fi
-
-  # ── 3. Cross-platform binary builds ───────────────────────────────────
+  # ── 2. Build the four platform binaries with the bumped version ────────
   build:
-    name: Build ${{ matrix.target }}
-    needs: [create-release, bump-and-tag]
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
+    name: build hoo-browser-${{ matrix.platform }}
+    needs: [version]
+    if: needs.version.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Native builders everywhere: no cross toolchain to break.
+          # darwin-x86_64 cross-compiles from the arm runner.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-          - os: macos-latest
-            target: x86_64-apple-darwin
+            platform: linux-aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            platform: darwin-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
-      - name: Build and upload
-        uses: taiki-e/upload-rust-binary-action@v1
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
-          bin: browsertools
-          target: ${{ matrix.target }}
-          archive: browsertools-$target
-          checksum: sha256
-          ref: refs/tags/${{ needs.bump-and-tag.outputs.tag }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: "1.100.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: stamp the release version before building
+        run: |
+          sed -i.bak "s/^version = \".*\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
+          rm Cargo.toml.bak
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: stage plain binary
+        run: cp target/${{ matrix.target }}/release/hoo-browser hoo-browser-${{ matrix.platform }}
+      - name: print sha256
+        # macOS runners have no sha256sum; shasum is the same SHA-256.
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            shasum -a 256 hoo-browser-${{ matrix.platform }}
+          else
+            sha256sum hoo-browser-${{ matrix.platform }}
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hoo-browser-${{ matrix.platform }}
+          path: hoo-browser-${{ matrix.platform }}
+          if-no-files-found: error
 
-  # ── 4. Aggregate SHA256SUMS ───────────────────────────────────────────
-  checksums:
-    name: Aggregate SHA256SUMS
-    needs: [build, bump-and-tag]
+  # ── 3. Bump, pin, commit, tag, release ────────────────────────────────
+  release:
+    needs: [version, build]
+    if: needs.version.outputs.version != ''
     runs-on: ubuntu-latest
     steps:
-      - name: Build SHA256SUMS from per-asset checksums
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git
         run: |
-          set -euo pipefail
-          tag="${{ needs.bump-and-tag.outputs.tag }}"
-          mkdir sums && cd sums
-          gh release download "$tag" --pattern '*.sha256' --dir .
-          : > SHA256SUMS
-          for f in *.sha256; do
-            awk '{ n = $2; sub(/.*\//, "", n); print $1 "  " n }' "$f" >> SHA256SUMS
-          done
-          sort -k2 -o SHA256SUMS SHA256SUMS
-          echo "==== SHA256SUMS ===="; cat SHA256SUMS
-          gh release upload "$tag" SHA256SUMS --clobber
+          git checkout -B main origin/main
+          git config user.name "GitHub Actions"
+          git config user.email "github-actions@github.com"
+
+      - name: bump Cargo.toml, Cargo.lock and plugin.json
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          sed -i "/^name = \"hoo-browser\"$/,/^version = /s/^version = \".*\"/version = \"$VERSION\"/" Cargo.lock
+          python3 - "$VERSION" <<'EOF'
+          import json, sys
+          path = "plugin/plugin.json"
+          manifest = json.loads(open(path).read())
+          manifest["version"] = sys.argv[1]
+          open(path, "w").write(json.dumps(manifest, indent=2) + "\n")
+          EOF
+          grep -m1 '^version' Cargo.toml
+          grep -A1 '^name = "hoo-browser"$' Cargo.lock | head -2
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: hoo-browser-*
+          path: dist
+          merge-multiple: true
+
+      - name: pin release sha256s into plugin/plugin.json
+        run: python3 scripts/update_manifest.py --version "${{ needs.version.outputs.version }}" --dir ./dist
+
+      - name: commit, tag and push
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          git add Cargo.toml Cargo.lock plugin/plugin.json
+          git commit -m "release: v${VERSION}"
+          git tag -a "v${VERSION}" -m "release: v${VERSION}"
+          git push origin main
+          git push origin "v${VERSION}"
+
+      - name: create the GitHub release with the 4 binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" dist/hoo-browser-* --clobber
+          else
+            gh release create "v$VERSION" --title "v$VERSION" \
+              --notes "hoo-browser v$VERSION" dist/hoo-browser-*
+          fi

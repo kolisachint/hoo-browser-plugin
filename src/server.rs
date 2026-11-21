@@ -1,0 +1,1868 @@
+//! The tier C helper server: MCP Streamable HTTP on the Unix socket.
+//!
+//! Contract (spec B2, same shape as hoocode's `echo_helper`):
+//! - Serves rmcp Streamable HTTP on `$HOOCODE_HELPER_SOCKET`, path `/mcp`.
+//! - Every request needs `Authorization: Bearer <known token>` (HTTP 401).
+//! - `token -> {agentId, parentId, depth}` map; `hoocode/agentStarted`
+//!   registers only a known sender's own children; `hoocode/agentEnded`
+//!   closes that agent's sessions; `hoocode/sessionEnding` exits.
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CustomNotification,
+    ErrorData, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+};
+use rmcp::service::{NotificationContext, RequestContext};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::{RoleServer, ServerHandler};
+use serde_json::{Map, Value};
+use tokio::sync::Mutex;
+
+use crate::error::HooError;
+use crate::exec::{self, ExecOutput};
+use crate::state::{AgentRecord, State};
+
+/// The 8 declared tools (served by `tools/list` and in the manifest).
+/// `browser_cli` is the hidden 9th: callable, never listed.
+pub const DECLARED_TOOLS: &[(&str, &str)] = &[
+    (
+        "browser_open",
+        "Open a URL in the caller's tab (agent-browser `open`).",
+    ),
+    (
+        "browser_snapshot",
+        "Accessibility snapshot of the caller's tab: refs for `browser_act`, text for reading.",
+    ),
+    (
+        "browser_act",
+        "Act on a ref from the snapshot: click, fill, select, check, uncheck, hover, press.",
+    ),
+    (
+        "browser_screenshot",
+        "Screenshot of the caller's tab, returned as an image.",
+    ),
+    (
+        "browser_tabs",
+        "List this agent's tabs, close one, or (root only) adopt another agent's tabs.",
+    ),
+    (
+        "browser_wait",
+        "Wait in the caller's tab: milliseconds, text, ref, or load state.",
+    ),
+    (
+        "browser_nav",
+        "Navigate the caller's tab: back, forward, reload.",
+    ),
+    (
+        "browser_eval",
+        "Run JavaScript in the caller's tab and return the result.",
+    ),
+];
+
+/// Shared helper state behind the MCP server.
+#[derive(Clone)]
+pub struct Helper {
+    inner: Arc<Inner>,
+}
+
+pub struct Inner {
+    pub state: Mutex<State>,
+    pub agent_browser: PathBuf,
+    pub cdp: String,
+    pub data_dir: PathBuf,
+    pub log_path: PathBuf,
+    /// agent-browser daemon isolation (see ).
+    pub sock_dir: PathBuf,
+    /// The shared Chromium. Killed explicitly on shutdown: `process::exit`
+    /// skips destructors, so `kill_on_drop` alone would orphan it (and the
+    /// profile lock) on the sessionEnding/parent-death paths.
+    pub chromium: Mutex<Option<tokio::process::Child>>,
+    /// Profile lock file this helper holds, removed on shutdown (C3).
+    /// `None` when the data profile was busy and we used the runtime one.
+    pub profile_lock: Mutex<Option<crate::backend::ProfileLock>>,
+    /// Socket this helper serves on, set by `serve`. Every fast-shutdown
+    /// path (sessionEnding, parent death, SIGTERM/SIGINT) removes it so no
+    /// stale socket shadows the next helper.
+    pub socket_path: Mutex<Option<PathBuf>>,
+    /// Scoped mode (B3): the agent-browser is the hoo fork (detected by
+    /// `-hoo.` in `--version`), so `--pin-tab` sessions' `tab list` shows
+    /// only their owned tabs: listings pass through and lease close takes
+    /// every listed target. Safe mode (upstream agent-browser) closes
+    /// only the bound target recorded at window open. Set once at
+    /// startup; tests set it directly. Defaults to safe.
+    pub ab_scoped: AtomicBool,
+    /// Cached path of the helper-owned `AGENT_BROWSER_CONFIG` (B6:
+    /// created once at startup, never stat+chmod per spawn).
+    pub agent_browser_config: PathBuf,
+}
+
+impl Helper {
+    pub fn new(
+        agent_browser: PathBuf,
+        cdp: String,
+        data_dir: PathBuf,
+        sock_dir: PathBuf,
+        root_token: String,
+        root_agent: String,
+    ) -> Self {
+        let mut state = State::default();
+        state.register_root(root_token, root_agent);
+        let log_path = data_dir.join("hoo-browser.log");
+        let agent_browser_config = exec::agent_browser_config_path(&sock_dir);
+        Self {
+            inner: Arc::new(Inner {
+                state: Mutex::new(state),
+                agent_browser,
+                cdp,
+                data_dir,
+                log_path,
+                sock_dir,
+                chromium: Mutex::new(None),
+                profile_lock: Mutex::new(None),
+                socket_path: Mutex::new(None),
+                ab_scoped: AtomicBool::new(false),
+                agent_browser_config,
+            }),
+        }
+    }
+
+    /// Set scoped mode (B3): call once at startup from the `--version`
+    /// probe (`backend::probe_ab_scoped`), or directly in tests.
+    pub fn set_scoped(&self, scoped: bool) {
+        self.inner.ab_scoped.store(scoped, Ordering::SeqCst);
+    }
+
+    fn is_scoped(&self) -> bool {
+        self.inner.ab_scoped.load(Ordering::SeqCst)
+    }
+
+    /// Hand the shared Chromium to the helper so shutdown kills it.
+    pub async fn set_chromium(
+        &self,
+        child: tokio::process::Child,
+        profile_lock: Option<crate::backend::ProfileLock>,
+    ) {
+        *self.inner.chromium.lock().await = Some(child);
+        *self.inner.profile_lock.lock().await = profile_lock;
+    }
+
+    /// Kill the shared Chromium, best effort. Runs before every
+    /// `process::exit`: destructors do not run there.
+    pub async fn shutdown(&self) {
+        if let Some(mut child) = self.inner.chromium.lock().await.take() {
+            // The main process first, then its whole group: Chromium's
+            // windowed subprocesses would otherwise survive (M9), keeping
+            // the profile locked for the next helper.
+            let _ = child.kill().await;
+            kill_tree(&child);
+            let _ = child.wait().await;
+        }
+        // Dropping the guard closes the fd and releases the flock (N4).
+        let _ = self.inner.profile_lock.lock().await.take();
+    }
+
+    /// Fast shutdown for sessionEnding, parent death and signals (N1):
+    /// kill the browser tree FIRST, then close leases with a hard ~1 s
+    /// cap, then reap, then remove the socket. hoocode waits ~2 s for us
+    /// to exit; the 60 s close_all could strand us past it. With the
+    /// browser already dead, the lease closes fail fast instead of hanging
+    /// on a wedged daemon.
+    pub async fn shutdown_fast(&self) {
+        if let Some(child) = self.inner.chromium.lock().await.as_ref() {
+            kill_tree(child);
+        }
+        self.close_all_capped(std::time::Duration::from_secs(1))
+            .await;
+        self.shutdown().await;
+        if let Some(path) = self.inner.socket_path.lock().await.clone() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The agent record for a bearer token, if known.
+    pub async fn agent_for(&self, token: &str) -> Option<AgentRecord> {
+        self.inner.state.lock().await.tokens.get(token).cloned()
+    }
+}
+
+/// Input schemas served by `tools/list`. The `manifest_matches_served_schemas`
+/// test pins them to `plugin/plugin.json`.
+pub fn tool_schemas() -> Vec<(String, String, Value)> {
+    fn schema(properties: &[(&str, Value)], required: &[&str]) -> Value {
+        let mut props = Map::new();
+        for (name, prop) in properties {
+            props.insert((*name).to_owned(), prop.clone());
+        }
+        Value::Object(
+            [
+                ("type".to_owned(), Value::String("object".into())),
+                ("properties".to_owned(), Value::Object(props)),
+                (
+                    "required".to_owned(),
+                    Value::Array(
+                        required
+                            .iter()
+                            .map(|n| Value::String((*n).into()))
+                            .collect(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+    fn string() -> Value {
+        Value::Object(
+            [("type".to_owned(), Value::String("string".into()))]
+                .into_iter()
+                .collect(),
+        )
+    }
+    fn described(mut value: Value, text: &str) -> Value {
+        value
+            .as_object_mut()
+            .expect("schema object")
+            .insert("description".into(), Value::String(text.into()));
+        value
+    }
+    fn string_enum(values: &[&str]) -> Value {
+        Value::Object(
+            [
+                ("type".to_owned(), Value::String("string".into())),
+                (
+                    "enum".to_owned(),
+                    Value::Array(values.iter().map(|v| Value::String((*v).into())).collect()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+    fn tab() -> Value {
+        described(
+            Value::Object(
+                [("type".to_owned(), Value::String("integer".into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            "Tab number, 1-based (default 1); a new number opens a tab.",
+        )
+    }
+    vec![
+        (
+            "browser_open".into(),
+            DECLARED_TOOLS[0].1.into(),
+            schema(&[("url", string()), ("tab", tab())], &["url"]),
+        ),
+        (
+            "browser_snapshot".into(),
+            DECLARED_TOOLS[1].1.into(),
+            schema(
+                &[
+                    ("tab", tab()),
+                    (
+                        "interactive",
+                        described(
+                            Value::Object(
+                                [("type".to_owned(), Value::String("boolean".into()))]
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            "Cursor position and interactive-only refs.",
+                        ),
+                    ),
+                ],
+                &[],
+            ),
+        ),
+        (
+            "browser_act".into(),
+            DECLARED_TOOLS[2].1.into(),
+            schema(
+                &[
+                    (
+                        "action",
+                        string_enum(&[
+                            "click", "fill", "select", "check", "uncheck", "hover", "press",
+                        ]),
+                    ),
+                    (
+                        "ref",
+                        described(string(), "Ref from the snapshot (e.g. \"e3\")."),
+                    ),
+                    (
+                        "value",
+                        described(string(), "Text for fill, option for select, key for press."),
+                    ),
+                    ("tab", tab()),
+                ],
+                &["action", "ref"],
+            ),
+        ),
+        (
+            "browser_screenshot".into(),
+            DECLARED_TOOLS[3].1.into(),
+            schema(
+                &[
+                    ("tab", tab()),
+                    (
+                        "full_page",
+                        described(
+                            Value::Object(
+                                [("type".to_owned(), Value::String("boolean".into()))]
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            "Capture the full page, not just the viewport.",
+                        ),
+                    ),
+                ],
+                &[],
+            ),
+        ),
+        (
+            "browser_tabs".into(),
+            DECLARED_TOOLS[4].1.into(),
+            schema(
+                &[
+                    ("action", string_enum(&["list", "close", "adopt"])),
+                    ("tab", tab()),
+                    (
+                        "from",
+                        described(
+                            string(),
+                            "Agent id to adopt tabs from (adopt only, root only).",
+                        ),
+                    ),
+                ],
+                &["action"],
+            ),
+        ),
+        (
+            "browser_wait".into(),
+            DECLARED_TOOLS[5].1.into(),
+            schema(
+                &[
+                    ("tab", tab()),
+                    (
+                        "ms",
+                        described(
+                            Value::Object(
+                                [("type".to_owned(), Value::String("integer".into()))]
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            "Milliseconds to wait.",
+                        ),
+                    ),
+                    ("text", described(string(), "Text to wait for.")),
+                    (
+                        "ref",
+                        described(string(), "Ref to wait for (from the snapshot)."),
+                    ),
+                    (
+                        "load",
+                        described(string(), "Load state to wait for (e.g. networkidle)."),
+                    ),
+                ],
+                &[],
+            ),
+        ),
+        (
+            "browser_nav".into(),
+            DECLARED_TOOLS[6].1.into(),
+            schema(
+                &[
+                    ("action", string_enum(&["back", "forward", "reload"])),
+                    ("tab", tab()),
+                ],
+                &["action"],
+            ),
+        ),
+        (
+            "browser_eval".into(),
+            DECLARED_TOOLS[7].1.into(),
+            schema(&[("js", string()), ("tab", tab())], &["js"]),
+        ),
+    ]
+}
+
+/// Bearer token of a request, from its `Authorization` header.
+fn bearer_of(parts: &http::request::Parts) -> Option<String> {
+    let value = parts.headers.get(http::header::AUTHORIZATION)?;
+    let value = value.to_str().ok()?;
+    value.strip_prefix("Bearer ").map(str::to_owned)
+}
+
+/// True when the request carries a known bearer token.
+async fn is_authorized<T>(request: &Request<T>, helper: &Helper) -> bool {
+    let Some(value) = request.headers().get(http::header::AUTHORIZATION) else {
+        return false;
+    };
+    let Some(token) = value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    helper.agent_for(token).await.is_some()
+}
+
+fn unauthorized_response() -> Response<BoxBody<Bytes, Infallible>> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(
+            Full::new(Bytes::from_static(b"unknown token"))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("401 response")
+}
+
+/// The rmcp service behind an HTTP-401 bearer check. rmcp has no auth layer
+/// of its own, so unknown tokens are rejected here, before rmcp sees them.
+///
+/// Request-entry stamp (M5): recorded here so the overhead window covers
+/// auth + decode, not just the tool body.
+#[derive(Clone, Copy)]
+struct RequestStarted(std::time::Instant);
+
+/// Request entry instant for the overhead log. The auth layer stamps
+/// `RequestStarted` into the HTTP request extensions, but rmcp puts the
+/// whole `http::request::Parts` into `context.extensions` — so the stamp
+/// reads back through the `Parts`, not directly (B2: a direct
+/// `get::<RequestStarted>()` is always `None`).
+fn request_started(extensions: &rmcp::model::Extensions) -> std::time::Instant {
+    extensions
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<RequestStarted>())
+        .map(|started| started.0)
+        .unwrap_or_else(std::time::Instant::now)
+}
+
+#[derive(Clone)]
+struct AuthService<S> {
+    helper: Helper,
+    inner: S,
+}
+
+impl<S> hyper::service::Service<Request<Incoming>> for AuthService<S>
+where
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = Response<BoxBody<Bytes, Infallible>>,
+            Error = Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response<BoxBody<Bytes, Infallible>>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
+
+    fn call(&self, request: Request<Incoming>) -> Self::Future {
+        let inner = self.inner.clone();
+        let helper = self.helper.clone();
+        Box::pin(async move {
+            // M5: stamp at request entry, before auth and the rmcp decode.
+            let (mut parts, body) = request.into_parts();
+            parts
+                .extensions
+                .insert(RequestStarted(std::time::Instant::now()));
+            let request = Request::from_parts(parts, body);
+            if !is_authorized(&request, &helper).await {
+                return Ok(unauthorized_response());
+            }
+            inner.call(request).await
+        })
+    }
+}
+
+/// Serve the helper on the Unix socket; returns when the listener fails.
+pub async fn serve(helper: Helper, socket: PathBuf) -> Result<(), HooError> {
+    let _ = std::fs::remove_file(&socket);
+    *helper.inner.socket_path.lock().await = Some(socket.clone());
+    let listener = tokio::net::UnixListener::bind(&socket)
+        .map_err(|e| HooError::Transport(format!("cannot bind {}: {e}", socket.display())))?;
+    eprintln!("hoo-browser: listening on {}", socket.display());
+    let factory_helper = helper.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(factory_helper.clone()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let base = TowerToHyperService::new(service);
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let service = AuthService {
+            helper: helper.clone(),
+            inner: base.clone(),
+        };
+        tokio::spawn(async move {
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
+/// MCP error for a refused call.
+fn refused(message: &str) -> ErrorData {
+    ErrorData::new(
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        message.to_string(),
+        None,
+    )
+}
+
+fn internal(message: String) -> ErrorData {
+    ErrorData::new(rmcp::model::ErrorCode::INTERNAL_ERROR, message, None)
+}
+
+/// Tool arg `tab`: 1-based, default 1. Non-integers, floats, zero and
+/// negatives are refused instead of silently defaulting (L2): resolving the
+/// wrong tab would address another lease's session.
+fn tab_of(args: &Value) -> Result<usize, HooError> {
+    match args.get("tab") {
+        None => Ok(1),
+        Some(Value::Number(n)) if n.as_u64().is_some_and(|v| v >= 1) => {
+            Ok(n.as_u64().expect("checked") as usize)
+        }
+        _ => Err(HooError::Failed("tab must be an integer >= 1".into())),
+    }
+}
+
+impl Helper {
+    /// Argv for a lease-scoped agent-browser call (H2: always pinned).
+    fn session_argv(&self, session: &str, command: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            self.inner.agent_browser.to_string_lossy().into_owned(),
+            "--cdp".into(),
+            self.inner.cdp.clone(),
+            "--session".into(),
+            session.into(),
+            "--json".into(),
+            "--pin-tab".into(),
+        ];
+        argv.extend(command.iter().map(|s| (*s).to_owned()));
+        argv
+    }
+
+    /// Run one lease-scoped CLI call for a tool call, retrying once when
+    /// the failure proves the command never reached the daemon (B1:
+    /// `NotSent`, the client connect-phase cold-start race, N7): the
+    /// second attempt's CLI finds the started daemon. Never retries
+    /// outcome_unknown, timeouts or post-send failures — the command may
+    /// have run, and re-sending a mutating command could double-execute.
+    /// Close/shutdown paths must not use this: they stay single-shot and
+    /// bounded.
+    async fn run_session_command(
+        &self,
+        argv: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<Value, HooError> {
+        match exec::run_command(
+            argv,
+            exec::spawn_timeout(deadline)?,
+            &self.inner.sock_dir,
+            &self.inner.agent_browser_config,
+        )
+        .await
+        {
+            Err(HooError::NotSent(_)) => {
+                exec::run_command(
+                    argv,
+                    exec::spawn_timeout(deadline)?,
+                    &self.inner.sock_dir,
+                    &self.inner.agent_browser_config,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    /// Same connect-phase-only retry for raw `browser_cli` output.
+    async fn run_session_raw(
+        &self,
+        scoped: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<String, HooError> {
+        match self.run_raw(scoped, exec::spawn_timeout(deadline)?).await {
+            Err(HooError::NotSent(_)) => self.run_raw(scoped, exec::spawn_timeout(deadline)?).await,
+            other => other,
+        }
+    }
+
+    /// Resolve the caller's tab to a session with its own window (H2): the
+    /// first call on a new tab runs `window new`; if that fails the lease is
+    /// rolled back so no phantom tab survives; concurrent first calls on a
+    /// new tab wait for the creator instead of opening duplicate windows.
+    async fn acquire(
+        &self,
+        agent: &AgentRecord,
+        token: &str,
+        tab: usize,
+        deadline: std::time::Instant,
+    ) -> Result<(String, std::time::Duration), HooError> {
+        let agent_id = agent.agent_id.as_str();
+        loop {
+            // B5: the token check and the lease mutation share one guard
+            // inside `ensure`. N5 still holds: agentEnded may have removed
+            // the caller's token while a concurrent initializer worked,
+            // so the re-check after a rollback (`None` below) refuses a
+            // dead agent instead of resurrecting its tab.
+            let (session, fresh) = self.inner.state.lock().await.ensure(token, agent_id, tab)?;
+            // Touch at call start (M7): the sweeper skips anything touched
+            // within the idle window, so a call in flight is never reaped.
+            let closing = {
+                let mut state = self.inner.state.lock().await;
+                state.touch(&session);
+                state.is_closing(&session)
+            };
+            if closing {
+                return Err(HooError::Failed(format!("tab {tab} is closing; try again")));
+            }
+            if fresh {
+                // The window-new wall time is reported separately (M5).
+                let window_started = std::time::Instant::now();
+                match self.open_window(&session, deadline).await {
+                    Ok(tab_id) => {
+                        let window_new = window_started.elapsed();
+                        self.inner.state.lock().await.mark_ready(&session);
+                        // B3 safe mode: remember the target this window
+                        // opened with (matched by `tabId`, never the live
+                        // `active` flag) so later closes and listings
+                        // touch only this lease's own tab. Scoped mode
+                        // needs none: its `tab list` is already owned-only.
+                        if !self.is_scoped() {
+                            let bound = self.bound_target_for(&session, &tab_id, deadline).await;
+                            self.inner
+                                .state
+                                .lock()
+                                .await
+                                .set_bound_target(&session, bound);
+                        }
+                        return Ok((session, window_new));
+                    }
+                    Err(e) => {
+                        self.inner.state.lock().await.abandon(&session);
+                        return Err(e);
+                    }
+                }
+            }
+            match self.inner.state.lock().await.is_initializing(&session) {
+                // Another call is opening this tab right now: wait for it.
+                Some(true) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(HooError::Failed(format!(
+                            "tab {tab} is still opening; try again"
+                        )));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                // Ready: run on it (no window ran on this call). Gone
+                // (rolled back under us): loop and re-ensure, which
+                // recreates the lease (after the N5 token re-check).
+                Some(false) => return Ok((session, std::time::Duration::ZERO)),
+                None => continue,
+            }
+        }
+    }
+
+    /// Run one tool call for `agent`: resolve the lease, run agent-browser,
+    /// log overhead. agent-browser failures come back as tool errors (isError),
+    /// so the model sees them; refusals are protocol errors.
+    async fn run_tool(
+        &self,
+        agent: &AgentRecord,
+        token: &str,
+        started: std::time::Instant,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Vec<ContentBlock>, HooError> {
+        if tool == "browser_cli" {
+            return self.run_cli(agent, token, started, args).await;
+        }
+        if tool == "browser_tabs" {
+            return self.run_tabs(agent, started, args).await;
+        }
+        // One budget for the whole call (M1): acquire-wait, window new and
+        // the command share it instead of stacking timeouts. `started` is
+        // the auth-layer entry stamp (M5): the total covers the whole call
+        // while `child` covers only agent-browser spawns.
+        let deadline = started + exec::CALL_BUDGET;
+        let tab = tab_of(args)?;
+        let (session, window_new) = self.acquire(agent, token, tab, deadline).await?;
+        let (child, output) = if tool == "browser_screenshot" {
+            self.run_screenshot(&session, args, deadline).await
+        } else {
+            let argv = exec::tool_argv(
+                &self.inner.agent_browser,
+                &self.inner.cdp,
+                &session,
+                tool,
+                args,
+                None,
+            )?;
+            let child_started = std::time::Instant::now();
+            let data = self.run_session_command(&argv, deadline).await;
+            (child_started.elapsed(), data.map(ExecOutput::Json))
+        };
+        let total = started.elapsed();
+        self.inner.state.lock().await.touch(&session);
+        let error = match &output {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        exec::log_call(
+            &self.inner.log_path,
+            exec::CallRecord {
+                tool,
+                agent: &agent.agent_id,
+                session: &session,
+                total,
+                child,
+                window_new,
+                ok: error.is_none(),
+                error: error.as_deref(),
+            },
+        )
+        .await;
+        match output? {
+            ExecOutput::Json(data) => Ok(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
+            )]),
+            ExecOutput::Png(bytes) => Ok(vec![ContentBlock::image(
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+                "image/png",
+            )]),
+        }
+    }
+
+    /// Hidden `browser_cli {args}`: raw passthrough scoped to the caller's
+    /// own sessions. `--json` is not forced; stdout returns as text.
+    async fn run_cli(
+        &self,
+        agent: &AgentRecord,
+        token: &str,
+        started: std::time::Instant,
+        args: &Value,
+    ) -> Result<Vec<ContentBlock>, HooError> {
+        let raw = args
+            .get("args")
+            .and_then(Value::as_array)
+            .ok_or_else(|| HooError::Refused("browser_cli needs \"args\"".into()))?;
+        let raw: Vec<String> = raw
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| HooError::Refused("browser_cli args must be strings".into()))
+            })
+            .collect::<Result<_, _>>()?;
+        let deadline = started + exec::CALL_BUDGET;
+        let (default_session, window_new) = self.acquire(agent, token, 1, deadline).await?;
+        let owned = self.inner.state.lock().await.owned(&agent.agent_id);
+        // B3: safe mode refuses `tab` outright (upstream `tab list` shows
+        // the whole shared browser); scoped mode allows `tab list` (the
+        // fork scopes it to owned tabs).
+        let scoped_argv = exec::scope_cli_args(
+            &raw,
+            &self.inner.cdp,
+            &default_session,
+            &owned,
+            self.is_scoped(),
+        )?;
+        let mut full = vec![self.inner.agent_browser.to_string_lossy().into_owned()];
+        full.extend(scoped_argv);
+        let child_started = std::time::Instant::now();
+        let text = self.run_session_raw(&full, deadline).await;
+        let child = child_started.elapsed();
+        let total = started.elapsed();
+        let error = match &text {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        exec::log_call(
+            &self.inner.log_path,
+            exec::CallRecord {
+                tool: "browser_cli",
+                agent: &agent.agent_id,
+                session: &default_session,
+                total,
+                child,
+                window_new,
+                ok: error.is_none(),
+                error: error.as_deref(),
+            },
+        )
+        .await;
+        text.map(|body| vec![ContentBlock::text(body)])
+    }
+
+    /// Give a fresh lease its own window on the shared browser: one
+    /// agent-browser `window new`. Returns the new tab id
+    /// (`{"tabId": "t9", …}`) so safe mode can bind the lease to the
+    /// target its window opened with (B3). The retry budget comes from
+    /// the caller's deadline: a connect-phase failure (N7) is retried
+    /// once with the remaining budget, so the retry never pushes a
+    /// window open past CALL_BUDGET.
+    async fn open_window(
+        &self,
+        session: &str,
+        deadline: std::time::Instant,
+    ) -> Result<String, HooError> {
+        let argv = self.session_argv(session, &["window", "new"]);
+        let data = self.run_session_command(&argv, deadline).await?;
+        Ok(data
+            .get("tabId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    /// The DevTools target the lease's window opened with (B3 safe mode):
+    /// match the `window new` tab id against a fresh `tab list`. Best
+    /// effort — a failure leaves the bound target unset and safe closes
+    /// skip the DevTools step rather than guess.
+    async fn bound_target_for(
+        &self,
+        session: &str,
+        tab_id: &str,
+        deadline: std::time::Instant,
+    ) -> Option<String> {
+        if tab_id.is_empty() {
+            return None;
+        }
+        let argv = self.session_argv(session, &["tab", "list"]);
+        let data = self.run_session_command(&argv, deadline).await.ok()?;
+        data.get("tabs")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|tab| tab.get("tabId").and_then(Value::as_str) == Some(tab_id))
+            .and_then(|tab| tab.get("targetId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    async fn run_screenshot(
+        &self,
+        session: &str,
+        args: &Value,
+        deadline: std::time::Instant,
+    ) -> (std::time::Duration, Result<ExecOutput, HooError>) {
+        let _ = crate::backend::ensure_dir_0700(&self.inner.data_dir.join("shots"));
+        let path = exec::shot_path(&self.inner.data_dir);
+        let argv = match exec::tool_argv(
+            &self.inner.agent_browser,
+            &self.inner.cdp,
+            session,
+            "browser_screenshot",
+            args,
+            Some(&path),
+        ) {
+            Ok(argv) => argv,
+            Err(e) => return (std::time::Duration::ZERO, Err(e)),
+        };
+        let child_started = std::time::Instant::now();
+        let result = self.run_session_command(&argv, deadline).await;
+        let child = child_started.elapsed();
+        let output = result.and_then(|_| {
+            std::fs::read(&path).map(ExecOutput::Png).map_err(|e| {
+                HooError::Failed(format!(
+                    "screenshot saved but cannot be read ({}): {e}",
+                    path.display()
+                ))
+            })
+        });
+        let _ = std::fs::remove_file(&path);
+        (child, output)
+    }
+
+    /// Raw passthrough for `browser_cli`: stdout is returned as text.
+    async fn run_raw(
+        &self,
+        scoped: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<String, HooError> {
+        use tokio::process::Command;
+        let (program, args) = scoped
+            .split_first()
+            .ok_or_else(|| HooError::Spawn("empty argv".into()))?;
+        let mut child = Command::new(program);
+        child
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        exec::child_env(
+            &mut child,
+            Some(&self.inner.sock_dir),
+            Some(&self.inner.agent_browser_config),
+        );
+        let output = tokio::time::timeout(timeout, child.output())
+            .await
+            .map_err(|_| {
+                HooError::Spawn(format!(
+                    "agent-browser timed out after {}s",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if output.status.success() {
+            Ok(stdout)
+        } else if stdout.trim().is_empty() {
+            Err(HooError::Failed(crate::error::short_stderr(&stderr)))
+        } else {
+            // B1: a `--json` caller gets the same connect-phase proof as
+            // `run_command`; anything else surfaces without retry.
+            if let Ok(envelope) = serde_json::from_str::<Value>(stdout.trim()) {
+                if let Some(error) = exec::envelope_connect_failure(&envelope) {
+                    return Err(HooError::NotSent(error));
+                }
+            }
+            Err(HooError::Failed(crate::error::short_stderr(&stdout)))
+        }
+    }
+
+    async fn run_tabs(
+        &self,
+        agent: &AgentRecord,
+        started: std::time::Instant,
+        args: &Value,
+    ) -> Result<Vec<ContentBlock>, HooError> {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+        let deadline = started + exec::CALL_BUDGET;
+        // Child (spawn+connect) time is measured per call, never equated
+        // with the total: the old `child: total` logged a permanent zero
+        // overhead (M5).
+        let mut child = std::time::Duration::ZERO;
+        let output: Result<Value, HooError> = match action {
+            "list" => {
+                let owned = self.inner.state.lock().await.owned(&agent.agent_id);
+                // A listing in flight touches its leases (M7).
+                {
+                    let mut state = self.inner.state.lock().await;
+                    for session in &owned {
+                        state.touch(session);
+                    }
+                }
+                let mut tabs = Vec::new();
+                for session in owned {
+                    let argv = exec::tool_argv(
+                        &self.inner.agent_browser,
+                        &self.inner.cdp,
+                        &session,
+                        "browser_tabs",
+                        &serde_json::json!({"action": "list"}),
+                        None,
+                    )?;
+                    if exec::spawn_timeout(deadline).is_err() {
+                        tabs.push(
+                            serde_json::json!({"session": session, "error": "call budget exceeded"}),
+                        );
+                        break;
+                    }
+                    let call_started = std::time::Instant::now();
+                    let result = self.run_session_command(&argv, deadline).await;
+                    child += call_started.elapsed();
+                    match result {
+                        Ok(data) => {
+                            // B3: scoped mode passes the list through (the
+                            // fork scopes `--pin-tab` sessions to their
+                            // owned tabs). Safe mode returns only this
+                            // lease's own bound entry — never other
+                            // agents' URLs.
+                            let listed = if self.is_scoped() {
+                                data.get("tabs").cloned().unwrap_or(Value::Null)
+                            } else {
+                                let bound = self
+                                    .inner
+                                    .state
+                                    .lock()
+                                    .await
+                                    .leases
+                                    .get(&session)
+                                    .and_then(|lease| lease.bound_target.clone());
+                                bound_tab_entry(&data, bound.as_deref())
+                            };
+                            tabs.push(serde_json::json!({"session": session, "tabs": listed}));
+                        }
+                        Err(e) => {
+                            tabs.push(
+                                serde_json::json!({"session": session, "error": e.to_string()}),
+                            );
+                        }
+                    }
+                }
+                Ok(Value::Array(tabs))
+            }
+            "close" => {
+                let tab = tab_of(args)?;
+                let session = self
+                    .inner
+                    .state
+                    .lock()
+                    .await
+                    .resolve(&agent.agent_id, tab)?;
+                // H4: `tab close` refuses the last tab over `--cdp` and
+                // `close` only disconnects, so close the lease's DevTools
+                // targets first, then `close` the session. The DevTools
+                // closes are the helper's own localhost HTTP, not child
+                // time; the list phase is capped well under the call
+                // budget so a wedged daemon cannot eat the `close` itself.
+                if exec::spawn_timeout(deadline).is_ok() {
+                    let list_started = std::time::Instant::now();
+                    self.close_lease_targets(&session).await;
+                    child += list_started.elapsed();
+                }
+                let argv = exec::tool_argv(
+                    &self.inner.agent_browser,
+                    &self.inner.cdp,
+                    &session,
+                    "browser_tabs",
+                    &serde_json::json!({"action": "close"}),
+                    None,
+                )?;
+                let call_started = std::time::Instant::now();
+                self.run_session_command(&argv, deadline).await?;
+                child += call_started.elapsed();
+                self.inner
+                    .state
+                    .lock()
+                    .await
+                    .close(&agent.agent_id, &session)?;
+                Ok(serde_json::json!({"closed": session}))
+            }
+            "adopt" => {
+                if agent.agent_id != "root" {
+                    return Err(HooError::Refused("adopt is root-only".into()));
+                }
+                let from = args
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| HooError::Refused("adopt needs \"from\" (agent id)".into()))?;
+                let count = self.inner.state.lock().await.adopt(from, "root")?;
+                Ok(serde_json::json!({"adopted": from, "tabs": count}))
+            }
+            _ => Err(HooError::Refused(format!(
+                "browser_tabs action must be one of list|close|adopt, got {action:?}"
+            ))),
+        };
+        let total = started.elapsed();
+        let error = match &output {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        exec::log_call(
+            &self.inner.log_path,
+            exec::CallRecord {
+                tool: "browser_tabs",
+                agent: &agent.agent_id,
+                session: "-",
+                total,
+                child,
+                // Listing and closing never acquire: no window can run.
+                window_new: std::time::Duration::ZERO,
+                ok: error.is_none(),
+                error: error.as_deref(),
+            },
+        )
+        .await;
+        output.map(|data| {
+            vec![ContentBlock::text(
+                serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
+            )]
+        })
+    }
+
+    /// Best-effort DevTools close of a lease's targets (H4: over `--cdp`
+    /// agent-browser's `tab close` refuses the last tab and `close` only
+    /// disconnects the session, so neither removes the lease's pages from
+    /// the shared browser).
+    ///
+    /// B3: scoped mode closes every target in the lease's `tab list` (the
+    /// fork scopes `--pin-tab` sessions to their owned tabs: bound,
+    /// opened, adopted popups). Safe mode closes only the bound target
+    /// recorded at window open — never the live `active` flag, which may
+    /// belong to another lease — and skips the step when it is unknown.
+    /// A failed list just skips the DevTools step.
+    async fn close_lease_targets(&self, session: &str) {
+        let bound = self
+            .inner
+            .state
+            .lock()
+            .await
+            .leases
+            .get(session)
+            .and_then(|lease| lease.bound_target.clone());
+        self.close_lease_targets_for(session, bound).await;
+    }
+
+    /// DevTools close with an explicit bound target (safe mode). The
+    /// `agentEnded` path snapshots bounds BEFORE `remove_agent` drops the
+    /// leases: looking the bound up after removal always yields `None` and
+    /// silently skips the only close safe mode performs (the live `active`
+    /// flag is never used — it may belong to another lease). Scoped mode
+    /// ignores the bound and closes every owned target from `tab list`.
+    async fn close_lease_targets_for(&self, session: &str, bound: Option<String>) {
+        // Safe mode needs no list: the bound target is already known, and
+        // gating the only close on an unrelated `tab list` would skip it
+        // whenever the daemon is wedged. Scoped mode lists first (the fork
+        // scopes it to owned tabs); a failed list skips the step.
+        let targets: Vec<String> = if self.is_scoped() {
+            let list = self.session_argv(session, &["tab", "list"]);
+            let timeout = exec::call_timeout().min(std::time::Duration::from_secs(15));
+            let Ok(data) = exec::run_command(
+                &list,
+                timeout,
+                &self.inner.sock_dir,
+                &self.inner.agent_browser_config,
+            )
+            .await
+            else {
+                return;
+            };
+            lease_targets(&data)
+        } else {
+            bound.into_iter().collect()
+        };
+        let Some(authority) = cdp_authority(&self.inner.cdp) else {
+            return;
+        };
+        for target in targets {
+            devtools_close_target(&authority, &target).await;
+        }
+    }
+
+    /// Close one agent-browser session, best effort (sweeper/agentEnded).
+    ///
+    /// Over `--cdp` `tab close` refuses the last tab and `close` only
+    /// disconnects the session, so neither removes the lease's page from
+    /// the shared browser (H4). Close the lease's targets through the
+    /// DevTools HTTP endpoint on the helper's own Chromium, then `close`
+    /// the session itself.
+    async fn close_session(&self, session: &str) {
+        let bound = self
+            .inner
+            .state
+            .lock()
+            .await
+            .leases
+            .get(session)
+            .and_then(|lease| lease.bound_target.clone());
+        self.close_session_with_bound(session, bound).await;
+    }
+
+    /// Close with an explicit bound target (safe mode): the caller
+    /// snapshotted it before the lease left the state map.
+    async fn close_session_with_bound(&self, session: &str, bound: Option<String>) {
+        // H4: over `--cdp` agent-browser's `tab close` refuses the last
+        // tab and `close` only disconnects the session, so neither removes
+        // the lease's pages from the shared browser. Close the lease's
+        // targets through the DevTools HTTP endpoint on the helper's own
+        // Chromium (`GET /json/close/<targetId>`), then `close` the
+        // session itself. All best effort: the process exits.
+        self.close_lease_targets_for(session, bound).await;
+        let close = self.session_argv(session, &["close"]);
+        let _ = exec::run_command(
+            &close,
+            exec::call_timeout(),
+            &self.inner.sock_dir,
+            &self.inner.agent_browser_config,
+        )
+        .await;
+    }
+}
+
+/// `ws://127.0.0.1:9222/devtools/...` -> `127.0.0.1:9222` for the DevTools
+/// HTTP endpoint (H4). The helper launched Chromium itself, so the port in
+/// its own `--cdp` value is the browser's port.
+fn cdp_authority(cdp: &str) -> Option<String> {
+    let bare = cdp
+        .strip_prefix("ws://")
+        .or_else(|| cdp.strip_prefix("wss://"))?;
+    let authority = bare.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority.to_owned())
+}
+
+/// Every target in a `tab list --json` envelope (B3 scoped mode): the
+/// fork scopes `--pin-tab` sessions' lists to their owned tabs (bound,
+/// opened, adopted popups), so closing all of them touches only the
+/// lease's own pages.
+fn lease_targets(data: &Value) -> Vec<String> {
+    data.get("tabs")
+        .and_then(Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|tab| {
+                    tab.get("targetId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The lease's own entry in a `tab list --json` envelope (B3 safe mode):
+/// the entry whose target matches the bound id recorded at window open.
+/// Anything else belongs to another lease and must not leak into safe
+/// listings. Unknown bound (or no match) yields an empty list rather
+/// than someone else's URL.
+fn bound_tab_entry(data: &Value, bound: Option<&str>) -> Value {
+    let entry = bound.and_then(|target| {
+        data.get("tabs")?
+            .as_array()?
+            .iter()
+            .find(|tab| tab.get("targetId").and_then(Value::as_str) == Some(target))
+            .cloned()
+    });
+    match entry {
+        Some(tab) => Value::Array(vec![tab]),
+        None => Value::Array(vec![]),
+    }
+}
+
+/// Close one page target through the DevTools HTTP endpoint (H4):
+/// `GET /json/close/<targetId>`. Frame the reply by Content-Length: the
+/// DevTools server keep-alives HTTP/1.1 connections despite
+/// `Connection: close`, so read-until-EOF would stall to the timeout on
+/// every target. Best effort with a short cap — a wedged browser must not
+/// stall lease closing; the `close` after it still drops the session.
+async fn devtools_close_target(authority: &str, target_id: &str) {
+    let work = async {
+        let mut stream = tokio::net::TcpStream::connect(authority)
+            .await
+            .map_err(|_| ())?;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let request = format!(
+            "GET /json/close/{target_id} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.map_err(|_| ())?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return Err(()),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > 65536 {
+                        return Err(());
+                    }
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                }
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let len: usize = headers
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+            })
+            .next()
+            .flatten()
+            .unwrap_or(0);
+        let mut have = buf.len() - header_end;
+        while have < len {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    have += n;
+                    if have > 1_000_000 {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok::<(), ()>(())
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), work).await;
+}
+
+impl Helper {
+    /// Close every lease (bounded concurrency) before killing Chromium (H3):
+    /// sessionEnding and parent death must not strand windows on the shared
+    /// browser. Best effort with an overall cap; the process exits next.
+    pub async fn close_all_sessions(&self) {
+        self.close_all_capped(std::time::Duration::from_secs(60))
+            .await;
+    }
+
+    /// Kill leftover agent-browser daemons owned by this helper: every
+    /// `<sock_dir>/<session>.pid` whose pid is still an agent-browser
+    /// process gets SIGTERM, then SIGKILL. Closing sessions alone only
+    /// disconnects them — the daemons would otherwise idle out after
+    /// `AGENT_BROWSER_IDLE_TIMEOUT_MS` (10 min), stranding a process per
+    /// test run. Best effort: dead pids and foreign processes are left
+    /// alone (the comm check guards against pid reuse).
+    pub async fn stop_daemons(&self) {
+        let agent_browser = self.inner.agent_browser.clone();
+        let sock_dir = self.inner.sock_dir.clone();
+        tokio::task::spawn_blocking(move || stop_daemons_blocking(&agent_browser, &sock_dir))
+            .await
+            .ok();
+    }
+
+    async fn close_all_capped(&self, cap: std::time::Duration) {
+        let sessions: Vec<(String, Option<String>)> = {
+            let state = self.inner.state.lock().await;
+            state
+                .leases
+                .iter()
+                .map(|(session, lease)| (session.clone(), lease.bound_target.clone()))
+                .collect()
+        };
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let mut set = tokio::task::JoinSet::new();
+        for (session, bound) in sessions {
+            let this = self.clone();
+            let semaphore = semaphore.clone();
+            set.spawn(async move {
+                let _permit = semaphore.acquire_owned().await;
+                this.close_session_with_bound(&session, bound).await;
+            });
+        }
+        let _ = tokio::time::timeout(cap, set.join_all()).await;
+    }
+}
+
+/// SIGKILL a child and its tree, but only via `killpg` when the child leads
+/// a group that is not ours (M9 sets that up for Chromium). A child that
+/// shares our group (tests, plain spawns) gets a single `kill`: killpg on
+/// a foreign pgid could hit an unrelated group.
+fn kill_tree(child: &tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+    let pid = pid as libc::pid_t;
+    // SAFETY: SIGKILL to our own child only.
+    let group_killed = unsafe {
+        let pgid = libc::getpgid(pid);
+        pgid == pid && pgid != libc::getpgrp() && libc::killpg(pid, libc::SIGKILL) == 0
+    };
+    if group_killed {
+        return;
+    }
+    // SAFETY: SIGKILL to our own child only.
+    unsafe {
+        let _ = libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// True while the pid exists (signal 0 checks: it sends nothing).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks, it sends nothing.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// The process command for a pid (`ps -o args=`), empty when gone.
+#[cfg(unix)]
+fn pid_command(pid: u32) -> String {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Blocking half of `Helper::stop_daemons`: SIGTERM every live
+/// agent-browser daemon listed in the socket dir, then SIGKILL the
+/// stragglers. A pid is only signalled when its command still names the
+/// agent-browser binary, so a recycled pid is never touched.
+#[cfg(unix)]
+fn stop_daemons_blocking(agent_browser: &std::path::Path, sock_dir: &std::path::Path) {
+    let binary = agent_browser.to_string_lossy();
+    let short = agent_browser
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut pids: Vec<u32> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(sock_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            if pid > 0 && pid_alive(pid) {
+                let command = pid_command(pid);
+                if !command.is_empty()
+                    && (command.contains(binary.as_ref()) || command.contains(&short))
+                {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    for pid in &pids {
+        // SAFETY: SIGTERM only to a live pid just verified as ours.
+        unsafe {
+            let _ = libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for pid in &pids {
+        while pid_alive(*pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // SAFETY: SIGKILL only to a live pid just verified as ours.
+        if pid_alive(*pid) {
+            unsafe {
+                let _ = libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+impl ServerHandler for Helper {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = Vec::new();
+        for (name, description, schema) in tool_schemas() {
+            let map: Map<String, Value> =
+                serde_json::from_value(schema).map_err(|e| internal(e.to_string()))?;
+            tools.push(Tool::new(name, description, std::sync::Arc::new(map)));
+        }
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let parts = context
+            .extensions
+            .get::<http::request::Parts>()
+            .cloned()
+            .ok_or_else(|| internal("no request parts".to_string()))?;
+        let token = bearer_of(&parts).ok_or_else(|| refused("unknown token"))?;
+        let agent = self
+            .agent_for(&token)
+            .await
+            .ok_or_else(|| refused("unknown token"))?;
+        // M5: the auth layer stamped request entry (read back through
+        // the `Parts` wrapper rmcp puts in the context extensions, B2);
+        // fall back to now only when the stamp is missing (direct
+        // in-process callers in tests).
+        let started = request_started(&context.extensions);
+        let name = request.name.as_ref();
+        if !DECLARED_TOOLS.iter().any(|(n, _)| *n == name) && name != "browser_cli" {
+            return Err(ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                format!("unknown tool {name}"),
+                None,
+            ));
+        }
+        let args = request
+            .arguments
+            .as_ref()
+            .map(|map| Value::Object(map.clone()))
+            .unwrap_or(Value::Null);
+        match self.run_tool(&agent, &token, started, name, &args).await {
+            Ok(blocks) => Ok(CallToolResult::success(blocks).into()),
+            Err(HooError::Refused(message)) => Err(refused(&message)),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())]).into()),
+        }
+    }
+
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        context: NotificationContext<RoleServer>,
+    ) {
+        let parts = context.extensions.get::<http::request::Parts>().cloned();
+        let Some(parts) = parts else { return };
+        let Some(token) = bearer_of(&parts) else {
+            return;
+        };
+        let Some(sender) = self.agent_for(&token).await else {
+            return;
+        };
+        match notification.method.as_str() {
+            "hoocode/agentStarted" => {
+                let params = notification.params.unwrap_or(Value::Null);
+                let agent_id = params
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let parent_id = params
+                    .get("parentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let depth = params.get("depth").and_then(Value::as_u64).unwrap_or(0);
+                let child_token = params
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut state = self.inner.state.lock().await;
+                let _ = state.register_agent(&sender, agent_id, parent_id, depth, child_token);
+            }
+            "hoocode/agentEnded" => {
+                let params = notification.params.unwrap_or(Value::Null);
+                let Some(agent_id) = params.get("agentId").and_then(Value::as_str) else {
+                    return;
+                };
+                // Only an agent strictly below the sender (or root) may be
+                // ended: a sibling ending another agent would steal its
+                // leases (H1). Anything else is ignored.
+                if sender.agent_id != "root"
+                    && !agent_id.starts_with(&format!("{}/", sender.agent_id))
+                {
+                    return;
+                }
+                // Snapshot safe-mode bounds BEFORE `remove_agent` drops the
+                // leases: `close_lease_targets` looks the bound up in the
+                // state map, so closing after removal would always find
+                // `None` and silently keep the ended agent's windows (safe
+                // mode's only close). Scoped mode ignores the snapshot and
+                // closes every owned target from `tab list`.
+                let ended: Vec<(String, Option<String>)> = {
+                    let state = self.inner.state.lock().await;
+                    state
+                        .order
+                        .get(agent_id)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|session| {
+                            state
+                                .leases
+                                .get(&session)
+                                .map(|lease| (session.clone(), lease.bound_target.clone()))
+                        })
+                        .collect()
+                };
+                self.inner.state.lock().await.remove_agent(agent_id);
+                for (session, bound) in ended {
+                    self.close_session_with_bound(&session, bound).await;
+                }
+            }
+            "hoocode/sessionEnding" => {
+                // Only root ends the session: anyone else's notice is noise.
+                if sender.agent_id != "root" {
+                    return;
+                }
+                self.shutdown_fast().await;
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Idle sweeper: every minute, close leases idle over the limit.
+/// Idle sweeper: every minute, close leases idle over the limit (M7).
+/// The check-then-claim protocol closes nothing a call touched: the sweep
+/// notes the time, claims only leases untouched since then, closes them
+/// browser-side, and re-checks before removal. A call starting mid-close
+/// touches its lease, so the re-check fails and the lease survives (the
+/// claim is released).
+pub async fn sweep_loop(helper: Helper) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        let check = std::time::Instant::now();
+        let idle = {
+            let state = helper.inner.state.lock().await;
+            state.idle(check)
+        };
+        for session in idle {
+            let claimed = {
+                let mut state = helper.inner.state.lock().await;
+                state.try_claim_close(&session, check)
+            };
+            if !claimed {
+                continue;
+            }
+            helper.close_session(&session).await;
+            let mut state = helper.inner.state.lock().await;
+            if state.still_idle(&session, check) {
+                state.remove_session(&session);
+            } else {
+                state.unclaim(&session);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_helper(dir: &std::path::Path) -> Helper {
+        Helper::new(
+            PathBuf::from("/bin/true"),
+            "ws://fake".into(),
+            dir.to_owned(),
+            crate::backend::socket_dir(dir),
+            "root-token".into(),
+            "root".into(),
+        )
+    }
+
+    #[test]
+    fn overhead_stamp_reads_through_the_parts_wrapper() {
+        // M5 stamps the HTTP request extensions; rmcp then wraps the whole
+        // `Parts` as one context extension. The stamp must be found through
+        // it (B2): a direct `get::<RequestStarted>()` on the context
+        // extensions is always `None`.
+        let at = std::time::Instant::now() - std::time::Duration::from_secs(7);
+        let mut request = http::Request::builder().body(()).expect("request");
+        request.extensions_mut().insert(RequestStarted(at));
+        let (parts, _) = request.into_parts();
+        // Direct lookup (the old, broken read) finds nothing …
+        let mut wrapped = rmcp::model::Extensions::new();
+        wrapped.insert(parts);
+        assert!(wrapped.get::<RequestStarted>().is_none());
+        // … while the Parts read finds the exact stamp.
+        let found = request_started(&wrapped);
+        assert!(
+            found.elapsed() >= std::time::Duration::from_secs(7),
+            "the entry stamp must survive the Parts wrapper"
+        );
+        // Missing stamp (direct in-process callers) falls back to now.
+        let fallback = request_started(&rmcp::model::Extensions::new());
+        assert!(fallback.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cdp_authority_takes_the_browser_port() {
+        assert_eq!(
+            cdp_authority("ws://127.0.0.1:9222/devtools/browser/abc").as_deref(),
+            Some("127.0.0.1:9222")
+        );
+        assert_eq!(
+            cdp_authority("wss://127.0.0.1:1/x").as_deref(),
+            Some("127.0.0.1:1")
+        );
+        assert_eq!(cdp_authority("http://127.0.0.1:9222/x"), None);
+        assert_eq!(cdp_authority("ws://"), None);
+        assert_eq!(cdp_authority(""), None);
+    }
+
+    #[test]
+    fn scoped_close_takes_every_listed_target() {
+        // Scoped mode (fork): the list is already owned-only, so every
+        // target closes — the `active` flag is irrelevant.
+        let data = serde_json::json!({"tabs": [
+            {"tabId": "t1", "targetId": "AAA", "active": false},
+            {"tabId": "t2", "targetId": "BBB", "active": true},
+            {"tabId": "t3", "targetId": "CCC"},
+        ]});
+        assert_eq!(lease_targets(&data), vec!["AAA", "BBB", "CCC"]);
+        assert!(lease_targets(&serde_json::json!({"tabs": []})).is_empty());
+        assert!(lease_targets(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn safe_listing_shows_only_the_bound_entry() {
+        // Safe mode (upstream): the list shows the whole shared browser,
+        // so listings keep only the bound target's entry — never other
+        // agents' URLs — and the `active` flag is ignored.
+        let data = serde_json::json!({"tabs": [
+            {"tabId": "t9", "targetId": "OWN", "active": false, "url": "https://own.example/"},
+            {"tabId": "t1", "targetId": "OTHER", "active": true, "url": "https://other.example/"},
+        ]});
+        let listed = bound_tab_entry(&data, Some("OWN"));
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                {"tabId": "t9", "targetId": "OWN", "active": false, "url": "https://own.example/"},
+            ])
+        );
+        // Unknown bound (or no match): empty, never someone else's tabs.
+        assert_eq!(bound_tab_entry(&data, None), serde_json::json!([]));
+        assert_eq!(bound_tab_entry(&data, Some("GONE")), serde_json::json!([]));
+        assert_eq!(
+            bound_tab_entry(&serde_json::json!({}), Some("OWN")),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn devtools_close_hits_json_close_for_the_target() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let authority = listener.local_addr().expect("addr").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 1024];
+            let n = stream.read(&mut buf).await.expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"closed\":1}")
+                .await;
+            // Keep the connection open like the real DevTools server
+            // (keep-alive despite `Connection: close`): the client must
+            // return from the framed body, not from EOF.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            request
+        });
+        let started = std::time::Instant::now();
+        devtools_close_target(&authority, "TARGET-9").await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the close must return from the framed body, not EOF/timeout"
+        );
+        let request = server.await.expect("server");
+        assert!(
+            request.starts_with("GET /json/close/TARGET-9 "),
+            "must close the target over DevTools HTTP, got: {request}"
+        );
+        // An unreachable browser never stalls the close (5 s cap, best effort).
+        devtools_close_target("127.0.0.1:1", "TARGET-9").await;
+    }
+
+    #[tokio::test]
+    async fn acquire_refuses_an_ended_agent_instead_of_recreating() {
+        // N5: agentEnded removes the token and the leases. A concurrent
+        // initializer finishing under the waiter must not bring the lease
+        // back: the re-ensure re-checks the token first.
+        let dir = std::env::temp_dir().join(format!("hoo-acquire-ended-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let helper = Helper::new(
+            std::path::PathBuf::from("/nonexistent/agent-browser-for-tests"),
+            "ws://fake".into(),
+            dir.clone(),
+            crate::backend::socket_dir(&dir),
+            "root-token".into(),
+            "root".into(),
+        );
+        let sender = helper
+            .inner
+            .state
+            .lock()
+            .await
+            .tokens
+            .get("root-token")
+            .cloned()
+            .expect("root token");
+        helper
+            .inner
+            .state
+            .lock()
+            .await
+            .register_agent(
+                &sender,
+                "root/task-1".into(),
+                Some("root".into()),
+                1,
+                "child-token".into(),
+            )
+            .expect("register");
+        // A lease created before the end (still initializing, as if its
+        // `window new` were in flight) goes away with agentEnded.
+        // B5: `ensure` takes the token, so the child token registers first.
+        helper.inner.state.lock().await.tokens.insert(
+            "child-token".into(),
+            AgentRecord {
+                agent_id: "root/task-1".into(),
+                parent_id: Some("root".into()),
+                depth: 1,
+            },
+        );
+        let (session, _) = helper
+            .inner
+            .state
+            .lock()
+            .await
+            .ensure("child-token", "root/task-1", 1)
+            .expect("ensure");
+        assert!(helper
+            .inner
+            .state
+            .lock()
+            .await
+            .is_initializing(&session)
+            .unwrap());
+        helper.inner.state.lock().await.remove_agent("root/task-1");
+        let agent = AgentRecord {
+            agent_id: "root/task-1".into(),
+            parent_id: Some("root".into()),
+            depth: 1,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(50);
+        let error = helper
+            .acquire(&agent, "child-token", 1, deadline)
+            .await
+            .expect_err("an ended agent must be refused");
+        assert!(
+            matches!(error, HooError::Refused(_)),
+            "ended acquire must be a refusal, got {error:?}"
+        );
+        assert!(
+            helper.inner.state.lock().await.leases.is_empty(),
+            "no lease may be recreated for a dead agent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_fast_kills_and_reaps_a_plain_child() {
+        let dir = std::env::temp_dir().join(format!("hoo-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = test_helper(&dir);
+        // A plain `sleep` shares our process group, so kill_tree must take
+        // the single-kill path (never killpg on our own group).
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let pid = child.id().expect("child pid") as libc::pid_t;
+        helper.set_chromium(child, None).await;
+        // Must return promptly even though the child would sleep 30 s.
+        tokio::time::timeout(std::time::Duration::from_secs(10), helper.shutdown_fast())
+            .await
+            .expect("shutdown_fast is bounded");
+        // Reaped: signalling the pid fails.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
