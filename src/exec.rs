@@ -133,8 +133,9 @@ pub fn tool_argv(
             refuse_dash("ref", &reference)?;
             // `click`/`hover`/`check`/`uncheck` take one positional via
             // `scan_single`, which honors `--`; `fill` skips `--` explicitly
-            // in its parser. `select` joins the rest literally and has no
-            // `--` handling, so its value passes through as data already.
+            // in its parser. `select` joins the rest literally with no `--`
+            // handling and `press` takes its key literally, so a leading `-`
+            // there can only be a forged flag: refuse it (M3).
             match action.as_str() {
                 "click" => push(&mut argv, &["click", "--", &reference]),
                 "hover" => push(&mut argv, &["hover", "--", &reference]),
@@ -150,11 +151,13 @@ pub fn tool_argv(
                     let value = str_arg("value").ok_or_else(|| {
                         HooError::Failed("browser_act select needs \"value\"".into())
                     })?;
+                    refuse_dash("value", &value)?;
                     push(&mut argv, &["select", &reference, &value]);
                 }
                 "press" => {
                     // `press` takes only a key: prefer "value", fall back to "ref".
                     let key = str_arg("value").unwrap_or(reference);
+                    refuse_dash("key", &key)?;
                     push(&mut argv, &["press", &key]);
                 }
                 _ => {
@@ -194,11 +197,15 @@ pub fn tool_argv(
         "browser_wait" => {
             push(&mut argv, &["wait"]);
             if let Some(text) = str_arg("text").filter(|t| !t.is_empty()) {
+                // `--text` consumes the next token as its value: a leading
+                // `-` would either misparse or smuggle a flag (M3).
+                refuse_dash("text", &text)?;
                 argv.extend(["--text".to_owned(), text]);
             } else if let Some(reference) = str_arg("ref").filter(|r| !r.is_empty()) {
                 refuse_dash("ref", &reference)?;
                 argv.push(reference);
             } else if let Some(load) = str_arg("load").filter(|l| !l.is_empty()) {
+                refuse_dash("load", &load)?;
                 argv.extend(["--load".to_owned(), load]);
             } else if let Some(ms) = args.get("ms").and_then(Value::as_u64) {
                 if ms > MAX_WAIT_MS {
@@ -951,7 +958,9 @@ mod tests {
     #[test]
     fn values_travel_past_end_of_options() {
         use base64::Engine as _;
-        // Refs and urls that look like flags are refused outright.
+        // Refs, urls, option values and keys that look like flags are
+        // refused outright (M3). `select` has no `--` handling and `press`
+        // takes its key literally, so a leading `-` there is never data.
         for (tool, args) in [
             ("browser_open", json!({"url": "--profile"})),
             ("browser_act", json!({"action": "click", "ref": "--json"})),
@@ -959,22 +968,23 @@ mod tests {
                 "browser_act",
                 json!({"action": "fill", "ref": "-e", "value": "x"}),
             ),
+            (
+                "browser_act",
+                json!({"action": "select", "ref": "e3", "value": "--x"}),
+            ),
+            (
+                "browser_act",
+                json!({"action": "press", "ref": "e1", "value": "--json"}),
+            ),
             ("browser_wait", json!({"ref": "--state"})),
+            ("browser_wait", json!({"text": "--foo"})),
+            ("browser_wait", json!({"load": "--foo"})),
         ] {
             assert!(
                 tool_argv(Path::new("ab"), "e", "s", tool, &args, None).is_err(),
                 "{tool} {args} must be refused"
             );
         }
-        // `select` joins its value literally (no `--` handling upstream),
-        // so a dash value is data, not a flag — but the ref is still checked.
-        assert_eq!(
-            tail(
-                "browser_act",
-                json!({"action": "select", "ref": "e3", "value": "--x"})
-            ),
-            vec!["select", "e3", "--x"]
-        );
         // A script starting with `-` goes over as base64 (`eval -b`),
         // since `eval` has no `--` handling and reads `-b`/`--stdin` first.
         let full = tool_argv(
