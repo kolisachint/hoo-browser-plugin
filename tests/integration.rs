@@ -918,24 +918,55 @@ async fn cdp_page_targets(endpoint: &str) -> usize {
         .trim_start_matches("ws://")
         .trim_start_matches("wss://");
     let host_port = bare.split('/').next().unwrap_or("").to_owned();
-    // HTTP/1.0 (not 1.1 + Connection: close): the DevTools server
-    // keep-alives 1.1 connections, which would stall read_to_end forever.
-    // Bounded anyway: a wedged browser must fail the test, not hang it.
+    // HTTP/1.1 framed by Content-Length: the DevTools server keep-alives
+    // 1.1 connections despite Connection: close (read_to_end would stall
+    // forever), and answers 1.0 with an empty reply. Bounded anyway: a
+    // wedged browser must fail the test, not hang it.
     let body = tokio::time::timeout(Duration::from_secs(15), async {
         let mut stream = tokio::net::TcpStream::connect(&host_port)
             .await
             .expect("cdp http");
-        let request = format!("GET /json/list HTTP/1.0\r\nHost: {host_port}\r\n\r\n");
+        let request =
+            format!("GET /json/list HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.expect("write");
-        let mut body = Vec::new();
-        stream.read_to_end(&mut body).await.expect("read");
-        body
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).await.expect("read headers");
+            if n == 0 {
+                panic!("cdp closed before headers");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 65536 {
+                panic!("cdp headers too large");
+            }
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]);
+        let len: usize = headers
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                (name.trim().to_ascii_lowercase() == "content-length")
+                    .then(|| value.trim().parse().ok())
+            })
+            .next()
+            .flatten()
+            .expect("cdp content-length");
+        while buf.len() < header_end + len {
+            let n = stream.read(&mut chunk).await.expect("read body");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf[header_end..(header_end + len).min(buf.len())].to_vec()
     })
     .await
     .expect("cdp /json timed out");
-    let text = String::from_utf8_lossy(&body);
-    let json_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-    serde_json::from_str::<Value>(&text[json_start..])
+    serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|targets| targets.as_array().cloned())
         .map(|targets| {
