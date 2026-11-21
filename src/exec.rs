@@ -344,15 +344,67 @@ fn is_refused_global(arg: &str) -> bool {
     REFUSED_VALUE_GLOBALS.contains(&name) || REFUSED_BOOL_GLOBALS.contains(&name)
 }
 
+/// Command-local flags verified against agent-browser's parser
+/// (`cli/src/commands.rs`). `Some(true)` takes a value (the next token is
+/// consumed as its value). Every other dash-token after the command is
+/// refused — including `--json`, which clean_args strips anywhere and would
+/// otherwise let `get --json cdp-url` slip past the subcommand position.
+fn allowed_cli_flag(command: &str, flag: &str) -> Option<bool> {
+    match command {
+        "click" => match flag {
+            "--human" | "--new-tab" => Some(false),
+            "--button" | "--modifiers" => Some(true),
+            _ => None,
+        },
+        "dblclick" => match flag {
+            "--human" => Some(false),
+            "--button" | "--modifiers" => Some(true),
+            _ => None,
+        },
+        "type" => match flag {
+            "--clear" => Some(false),
+            "--delay" => Some(true),
+            _ => None,
+        },
+        "snapshot" => match flag {
+            "--interactive" | "-i" | "--compact" | "-c" | "--cursor" | "-C" | "--urls" | "-u"
+            | "--delta" | "--full" => Some(false),
+            "--depth" | "-d" | "--selector" | "-s" => Some(true),
+            _ => None,
+        },
+        "screenshot" => match flag {
+            "--full" | "-f" | "--if-changed" => Some(false),
+            "--threshold" => Some(true),
+            _ => None,
+        },
+        "wait" => match flag {
+            "--download" | "-d" => Some(false),
+            "--state" | "--timeout" | "--url" | "-u" | "--load" | "-l" | "--fn" | "-f"
+            | "--text" | "-t" => Some(true),
+            _ => None,
+        },
+        "eval" => match flag {
+            "-b" | "--base64" | "--stdin" => Some(false),
+            _ => None,
+        },
+        // open/goto/navigate/back/forward/reload/fill/select/hover/focus/
+        // check/uncheck/press/key/get/tab/window/close take no flags
+        // upstream (scan_single / parse_selector / positional-only arms
+        // reject them), so none are allowed here either.
+        _ => None,
+    }
+}
+
 /// Scope raw CLI-fallback args to the caller's own sessions (spec B2): only
 /// allow-listed commands run, and only inside the caller's own leases. A
 /// `--session` naming another agent's session is refused; without one, the
 /// caller's default lease is injected; `--cdp` is always the helper's (the
 /// shared browser is not optional). Every global flag is refused anywhere
-/// before `--` — leading or trailing — so `--profile`/`--config`/
-/// `--executable-path` smuggled after the command cannot escape the shared
-/// browser. Past `--`, args are literal data and pass through untouched,
-/// matching agent-browser's own parser.
+/// before `--` — leading or trailing. After the command, only the command's
+/// own verified local flags pass (N2): agent-browser strips `--json` and
+/// other globals before parsing, so `get --json cdp-url` would otherwise
+/// read as `get cdp-url`. Past `--`, args are literal data and pass
+/// through untouched, matching agent-browser's own parser.
 pub fn scope_cli_args(
     raw: &[String],
     cdp: &str,
@@ -404,10 +456,11 @@ pub fn scope_cli_args(
         )));
     }
     let rest = &head[i + 1..];
-    check_command_rest(&command, rest)?;
-    // Trailing globals: refused even here, since agent-browser strips them
-    // anywhere on the line. Command values that happen to start with `-`
-    // must go past `--` (e.g. `fill e3 -- -x`).
+    // Trailing flags: agent-browser strips globals anywhere on the line
+    // before parsing, so only verified command-local flags may follow the
+    // command (N2). `--session` stays leading-only (ownership-checked
+    // there); values starting with `-` must go past `--`.
+    let mut positional: Vec<&str> = Vec::new();
     let mut rest_iter = rest.iter().peekable();
     while let Some(arg) = rest_iter.next() {
         if arg == "--state" && command == "wait" {
@@ -428,10 +481,29 @@ pub fn scope_cli_args(
             }
             continue;
         }
-        if arg.starts_with('-') && is_refused_global(arg) {
-            return Err(refused_global(arg));
+        if arg.starts_with('-') {
+            if is_refused_global(arg) {
+                return Err(refused_global(arg));
+            }
+            match allowed_cli_flag(&command, arg) {
+                Some(takes_value) => {
+                    // Consume the flag's value sight unseen: it belongs to
+                    // the flag even when it starts with `-`.
+                    if takes_value {
+                        rest_iter.next();
+                    }
+                }
+                None => {
+                    return Err(HooError::Refused(format!(
+                        "browser_cli: {arg:?} is not a {command} flag (--json and other flags are not allowed after the command)"
+                    )));
+                }
+            }
+            continue;
         }
+        positional.push(arg);
     }
+    check_command_rest(&command, positional.first().copied())?;
 
     let mut scoped = vec!["--cdp".to_owned(), cdp.to_owned(), "--pin-tab".to_owned()];
     if !saw_session {
@@ -445,30 +517,33 @@ pub fn scope_cli_args(
     Ok(scoped)
 }
 
-/// Per-command restrictions inside the caller's own session.
-fn check_command_rest(command: &str, rest: &[String]) -> Result<(), HooError> {
+/// Per-command restrictions inside the caller's own session. Checks the
+/// first positional, so flags can no longer hide the subcommand
+/// (`get --json cdp-url` is refused for its `cdp-url`, not its `--json`).
+fn check_command_rest(command: &str, first_positional: Option<&str>) -> Result<(), HooError> {
     // `get cdp-url` leaks the shared endpoint; the rest reads the page.
-    if command == "get" && rest.first().is_some_and(|s| s == "cdp-url") {
+    if command == "get" && first_positional == Some("cdp-url") {
         return Err(HooError::Refused(
             "browser_cli: `get cdp-url` is not allowed (the shared browser is not optional)".into(),
         ));
     }
     // `tab <id>` would switch to another tab and `tab new/close` manage
     // tabs around the helper; only listing stays.
-    if command == "tab" && rest.first().is_some_and(|s| s != "list") {
+    if command == "tab" && first_positional.is_some_and(|s| s != "list") {
         return Err(HooError::Refused(
             "browser_cli: only `tab list` is allowed (use browser_tabs to close)".into(),
         ));
     }
     // `window` only builds new windows; keep it that way.
-    if command == "window" && !rest.first().is_some_and(|s| s == "new") {
+    if command == "window" && first_positional != Some("new") {
         return Err(HooError::Refused(
             "browser_cli: only `window new` is allowed".into(),
         ));
     }
     // `close --all` would close every agent's sessions; a bare `close`
-    // only ends the caller's own lease.
-    if command == "close" && rest.iter().any(|a| a.starts_with('-')) {
+    // only ends the caller's own lease. (Dash-tokens never reach here as
+    // positionals; this stays as defence in depth.)
+    if command == "close" && first_positional.is_some_and(|s| s.starts_with('-')) {
         return Err(HooError::Refused(
             "browser_cli: `close --all` is not allowed (use browser_tabs close)".into(),
         ));
@@ -995,9 +1070,48 @@ mod tests {
         // Past `--`, tokens are literal data, matching agent-browser.
         let scoped = scope(&["fill", "e1", "--", "--session", "root-99"]).unwrap();
         assert!(scoped.contains(&"--".to_owned()));
-        // --json stays allowed (output shape only), anywhere.
+        // Leading --json stays allowed (output shape only); after the
+        // command it is refused: agent-browser strips it before parsing,
+        // so it would hide the real subcommand (N2).
         assert!(scope(&["--json", "snapshot"]).is_ok());
-        assert!(scope(&["snapshot", "--json"]).is_ok());
+        assert!(scope(&["snapshot", "--json"]).is_err());
+    }
+
+    #[test]
+    fn cli_scoping_refuses_flags_after_the_command() {
+        let owned = vec!["root_task-1-1".to_owned()];
+        let scope = |raw: &[&str]| scope_cli_args(&args(raw), "ws://e", "root_task-1-1", &owned);
+        // The motivating bypass: --json stripped before parsing, leaving
+        // `get cdp-url` to leak the shared endpoint.
+        for raw in [
+            vec!["get", "--json", "cdp-url"],
+            vec!["get", "--session", "root_task-1-1", "cdp-url"],
+            vec!["tab", "--json", "t2"],
+            vec!["snapshot", "--session", "root_task-1-1"],
+            vec!["open", "--json", "https://x.example/"],
+            vec!["snapshot", "--bogus"],
+            vec!["eval", "--json"],
+            vec!["back", "--json"],
+            vec!["fill", "e3", "--json"],
+            vec!["type", "e3", "--clear", "--json"],
+        ] {
+            assert!(scope(&raw).is_err(), "{raw:?} must be refused");
+        }
+        // Verified command-local flags stay usable (mirrors the parser).
+        for raw in [
+            vec!["click", "e3", "--button", "left"],
+            vec!["click", "e3", "--human", "--modifiers", "alt"],
+            vec!["snapshot", "--interactive", "--depth", "3"],
+            vec!["screenshot", "--full"],
+            vec!["wait", "--text", "done"],
+            vec!["wait", "--timeout", "5000"],
+            vec!["type", "e3", "--clear"],
+            vec!["eval", "-b", "aGk="],
+            vec!["tab", "list"],
+            vec!["get", "url"],
+        ] {
+            assert!(scope(&raw).is_ok(), "{raw:?} must pass");
+        }
     }
 
     #[test]
