@@ -61,6 +61,19 @@ jstr() { printf '"%s"' "$1"; }
 
 case "$cmd" in
     "window")
+        # One-shot failure hook: when a file named after the pending
+        # session exists in this dir, the first `window new` for that
+        # session fails with the file's content as the error and consumes
+        # the file, so the retry (if any) succeeds. Replays cold-start
+        # races: connect-phase text (the command never ran) or a
+        # post-send read failure (outcome_unknown: it may have run).
+        if [ -n "${FAKE_FAIL_ONCE_DIR:-}" ] \
+            && [ -f "$FAKE_FAIL_ONCE_DIR/$session" ]; then
+            text=$(cat "$FAKE_FAIL_ONCE_DIR/$session")
+            rm -f "$FAKE_FAIL_ONCE_DIR/$session"
+            fail "$text"
+            exit 1
+        fi
         if [ -n "${FAKE_FAIL_FILE:-}" ] && [ -f "$FAKE_FAIL_FILE" ] \
             && grep -qxF "$session" "$FAKE_FAIL_FILE" 2>/dev/null; then
             fail '"window new failed (injected)"'

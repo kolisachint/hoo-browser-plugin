@@ -525,6 +525,40 @@ impl Helper {
         argv
     }
 
+    /// Run one lease-scoped CLI call for a tool call, retrying once when
+    /// the failure proves the command never reached the daemon
+    /// (connect-phase cold-start race, N7): the second attempt's CLI
+    /// finds the started daemon. Never retries outcome_unknown, timeouts
+    /// or post-send failures — the command may have run, and re-sending a
+    /// mutating command could double-execute. Close/shutdown paths must
+    /// not use this: they stay single-shot and bounded.
+    async fn run_session_command(
+        &self,
+        argv: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<Value, HooError> {
+        match exec::run_command(argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir).await {
+            Err(e) if exec::not_sent_to_daemon(&e.to_string()) => {
+                exec::run_command(argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir).await
+            }
+            other => other,
+        }
+    }
+
+    /// Same connect-phase-only retry for raw `browser_cli` output.
+    async fn run_session_raw(
+        &self,
+        scoped: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<String, HooError> {
+        match self.run_raw(scoped, exec::spawn_timeout(deadline)?).await {
+            Err(e) if exec::not_sent_to_daemon(&e.to_string()) => {
+                self.run_raw(scoped, exec::spawn_timeout(deadline)?).await
+            }
+            other => other,
+        }
+    }
+
     /// Resolve the caller's tab to a session with its own window (H2): the
     /// first call on a new tab runs `window new`; if that fails the lease is
     /// rolled back so no phantom tab survives; concurrent first calls on a
@@ -561,10 +595,7 @@ impl Helper {
             if fresh {
                 // The window-new wall time is reported separately (M5).
                 let window_started = std::time::Instant::now();
-                match self
-                    .open_window(&session, exec::spawn_timeout(deadline)?)
-                    .await
-                {
+                match self.open_window(&session, deadline).await {
                     Ok(()) => {
                         let window_new = window_started.elapsed();
                         self.inner.state.lock().await.mark_ready(&session);
@@ -631,9 +662,7 @@ impl Helper {
                 None,
             )?;
             let child_started = std::time::Instant::now();
-            let data =
-                exec::run_command(&argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir)
-                    .await;
+            let data = self.run_session_command(&argv, deadline).await;
             (child_started.elapsed(), data.map(ExecOutput::Json))
         };
         let total = started.elapsed();
@@ -695,7 +724,7 @@ impl Helper {
         let mut full = vec![self.inner.agent_browser.to_string_lossy().into_owned()];
         full.extend(scoped);
         let child_started = std::time::Instant::now();
-        let text = self.run_raw(&full, exec::spawn_timeout(deadline)?).await;
+        let text = self.run_session_raw(&full, deadline).await;
         let child = child_started.elapsed();
         let total = started.elapsed();
         let error = match &text {
@@ -719,14 +748,18 @@ impl Helper {
         text.map(|body| vec![ContentBlock::text(body)])
     }
 
-    /// Give a fresh lease its own window on the shared browser.
+    /// Give a fresh lease its own window on the shared browser: one
+    /// agent-browser `window new`. The retry budget comes from the
+    /// caller's deadline: a connect-phase failure (N7) is retried once
+    /// with the remaining budget, so the retry never pushes a window
+    /// open past CALL_BUDGET.
     async fn open_window(
         &self,
         session: &str,
-        timeout: std::time::Duration,
+        deadline: std::time::Instant,
     ) -> Result<(), HooError> {
         let argv = self.session_argv(session, &["window", "new"]);
-        exec::run_command(&argv, timeout, &self.inner.sock_dir).await?;
+        self.run_session_command(&argv, deadline).await?;
         Ok(())
     }
 
@@ -750,10 +783,7 @@ impl Helper {
             Err(e) => return (std::time::Duration::ZERO, Err(e)),
         };
         let child_started = std::time::Instant::now();
-        let result = match exec::spawn_timeout(deadline) {
-            Ok(timeout) => exec::run_command(&argv, timeout, &self.inner.sock_dir).await,
-            Err(e) => Err(e),
-        };
+        let result = self.run_session_command(&argv, deadline).await;
         let child = child_started.elapsed();
         let output = result.and_then(|_| {
             std::fs::read(&path).map(ExecOutput::Png).map_err(|e| {
@@ -835,17 +865,14 @@ impl Helper {
                         &serde_json::json!({"action": "list"}),
                         None,
                     )?;
-                    let timeout = match exec::spawn_timeout(deadline) {
-                        Ok(timeout) => timeout,
-                        Err(e) => {
-                            tabs.push(
-                                serde_json::json!({"session": session, "error": e.to_string()}),
-                            );
-                            break;
-                        }
-                    };
+                    if exec::spawn_timeout(deadline).is_err() {
+                        tabs.push(
+                            serde_json::json!({"session": session, "error": "call budget exceeded"}),
+                        );
+                        break;
+                    }
                     let call_started = std::time::Instant::now();
-                    let result = exec::run_command(&argv, timeout, &self.inner.sock_dir).await;
+                    let result = self.run_session_command(&argv, deadline).await;
                     child += call_started.elapsed();
                     match result {
                         Ok(data) => tabs.push(
@@ -902,8 +929,7 @@ impl Helper {
                     None,
                 )?;
                 let call_started = std::time::Instant::now();
-                exec::run_command(&argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir)
-                    .await?;
+                self.run_session_command(&argv, deadline).await?;
                 child += call_started.elapsed();
                 self.inner
                     .state

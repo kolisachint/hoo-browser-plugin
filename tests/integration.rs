@@ -452,7 +452,12 @@ async fn fake_parallel_agents_cross_agent_refused_and_lifecycle() {
 
 /// Wrapper around the fake so each test gets its own argv log and fail
 /// file (process env is shared by parallel tests, files are not).
-fn fake_wrapper(dir: &Path, argv_log: &Path, fail_file: Option<&Path>) -> PathBuf {
+fn fake_wrapper(
+    dir: &Path,
+    argv_log: &Path,
+    fail_file: Option<&Path>,
+    fail_once: Option<&Path>,
+) -> PathBuf {
     fn sh_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
@@ -464,6 +469,12 @@ fn fake_wrapper(dir: &Path, argv_log: &Path, fail_file: Option<&Path>) -> PathBu
     );
     if let Some(fail) = fail_file {
         script.push_str(&format!("export FAKE_FAIL_FILE={}\n", sh_quote(fail)));
+    }
+    if let Some(once_dir) = fail_once {
+        script.push_str(&format!(
+            "export FAKE_FAIL_ONCE_DIR={}\n",
+            sh_quote(once_dir)
+        ));
     }
     script.push_str(&format!(
         "exec {} \"$@\"\n",
@@ -491,7 +502,7 @@ fn argv_lines(log: &Path) -> Vec<String> {
 async fn fake_every_call_carries_session_and_pin_tab() {
     let dir = test_tmp("argv");
     let argv_log = dir.join("argv.log");
-    let fake = fake_wrapper(&dir, &argv_log, None);
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
     let (helper, socket) = start_helper(&fake, &dir).await;
     let root = connect(&socket, ROOT_TOKEN).await;
     notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
@@ -561,7 +572,7 @@ async fn fake_agent_browser_config_is_helper_owned() {
     let dir = test_tmp("config");
     let argv_log = dir.join("argv.log");
     let env_log = dir.join("argv.log.env");
-    let fake = fake_wrapper(&dir, &argv_log, None);
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
     let (_helper, socket) = start_helper(&fake, &dir).await;
     let peer = connect(&socket, ROOT_TOKEN).await;
     call(
@@ -613,7 +624,7 @@ async fn fake_window_new_failure_rolls_the_lease_back() {
     let dir = test_tmp("rollback");
     let argv_log = dir.join("argv.log");
     let fail_file = dir.join("fail");
-    let fake = fake_wrapper(&dir, &argv_log, Some(&fail_file));
+    let fake = fake_wrapper(&dir, &argv_log, Some(&fail_file), None);
     let (helper, socket) = start_helper(&fake, &dir).await;
     let root = connect(&socket, ROOT_TOKEN).await;
     notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
@@ -651,6 +662,16 @@ async fn fake_window_new_failure_rolls_the_lease_back() {
         !opened_tab2(&calls),
         "no open ran on the failed lease: {calls:?}"
     );
+    // A post-send failure (not a connect-phase one) must not be retried:
+    // re-sending could double-execute. Exactly one `window new` ran.
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|l| l.contains("--session root_task-1-2") && l.contains("window new"))
+            .count(),
+        1,
+        "a failed window new must run exactly once: {calls:?}"
+    );
     let tab1 = call(&child, "browser_snapshot", serde_json::json!({}))
         .await
         .expect("tab 1 survives");
@@ -670,6 +691,109 @@ async fn fake_window_new_failure_rolls_the_lease_back() {
     assert!(
         opened_tab2(&calls),
         "tab 2 reuses its name after rollback: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn fake_connect_phase_failure_retries_window_new_once() {
+    // Cold-start race (N7): the first `window new` fails at connect time
+    // (the daemon is not accepting yet), so the command provably never
+    // ran. The helper retries once and the open succeeds with exactly
+    // one `open`; the retry's `window new` is the only second one.
+    let dir = test_tmp("connect-retry");
+    let argv_log = dir.join("argv.log");
+    let once_dir = dir.join("fail-once");
+    std::fs::create_dir_all(&once_dir).expect("once dir");
+    // A dedicated agent: no other test uses this session, so the
+    // process-global hook cannot leak into (or be consumed by) them.
+    std::fs::write(
+        once_dir.join("root_connect-retry-1"),
+        "Failed to connect: Connection refused (os error 61)",
+    )
+    .expect("arm one-shot");
+    let fake = fake_wrapper(&dir, &argv_log, None, Some(&once_dir));
+    let (helper, socket) = start_helper(&fake, &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/connect-retry", "retry-token").await;
+    let retry = connect(&socket, "retry-token").await;
+    let opened = call(
+        &retry,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("protocol ok");
+    assert!(
+        !is_error(&opened),
+        "open must succeed after the connect-phase retry: {}",
+        text_of(&opened)
+    );
+    let calls = argv_lines(&argv_log);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|l| l.contains("--session root_connect-retry-1") && l.contains("window new"))
+            .count(),
+        2,
+        "the failed window new runs exactly twice (one retry): {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|l| l.contains("--session root_connect-retry-1") && l.contains(" open "))
+            .count(),
+        1,
+        "the retried lease opens exactly once: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn fake_post_send_failure_never_retries() {
+    // The reported cold-start symptom replayed: the first `window new`
+    // fails after the send (read EAGAIN, outcome unknown), so the command
+    // may have run. The helper must surface the error, not retry: exactly
+    // one `window new`, no `open`, and the lease rolls back.
+    let dir = test_tmp("send-noretry");
+    let argv_log = dir.join("argv.log");
+    let once_dir = dir.join("fail-once");
+    std::fs::create_dir_all(&once_dir).expect("once dir");
+    std::fs::write(
+        once_dir.join("root_send-noretry-1"),
+        "Failed to read: Resource temporarily unavailable (os error 35) (outcome_unknown: the command may have run, so it was not retried)",
+    )
+    .expect("arm one-shot");
+    let fake = fake_wrapper(&dir, &argv_log, None, Some(&once_dir));
+    let (helper, socket) = start_helper(&fake, &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/send-noretry", "noretry-token").await;
+    let agent = connect(&socket, "noretry-token").await;
+    let opened = call(
+        &agent,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("protocol ok");
+    assert!(is_error(&opened), "post-send failure must surface");
+    assert!(
+        text_of(&opened).contains("os error 35"),
+        "the daemon error reaches the model: {}",
+        text_of(&opened)
+    );
+    let calls = argv_lines(&argv_log);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|l| l.contains("--session root_send-noretry-1") && l.contains("window new"))
+            .count(),
+        1,
+        "a post-send failure runs exactly once (never retried): {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|l| l.contains("--session root_send-noretry-1") && l.contains(" open ")),
+        "no open runs on the failed lease: {calls:?}"
     );
 }
 
@@ -725,7 +849,7 @@ async fn fake_close_lists_targets_before_closing_the_session() {
     // so it must never be the close path.
     let dir = test_tmp("closetargets");
     let argv_log = dir.join("argv.log");
-    let fake = fake_wrapper(&dir, &argv_log, None);
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
     let (helper, socket) = start_helper(&fake, &dir).await;
     let root = connect(&socket, ROOT_TOKEN).await;
     notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
@@ -796,7 +920,7 @@ async fn fake_spawn_and_timeout_failures_are_tool_errors() {
     // test; concurrent fake calls take milliseconds, far under either).
     let dir = test_tmp("timeout");
     let argv_log = dir.join("argv.log");
-    let fake = fake_wrapper(&dir, &argv_log, None);
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
     let (helper, socket) = start_helper(&fake, &dir).await;
     let root = connect(&socket, ROOT_TOKEN).await;
     notify_started_child(&helper, &root, "root/slowpoke", "slow-token").await;
@@ -1093,6 +1217,15 @@ async fn start_test_page() -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://127.0.0.1:{port}/"), handle)
 }
 
+/// The known-transient daemon race: the CLI wrote the full request, then
+/// the response read hit EAGAIN (os error 35, macOS) under a cold or
+/// loaded daemon, reported as outcome_unknown — or a navigation burst
+/// aborted the load (ERR_ABORTED). The helper never auto-retries these
+/// (the command may have run); callers re-issue once like a user would.
+fn transient_daemon_race(text: &str) -> bool {
+    text.contains("os error 35") || text.contains("outcome_unknown") || text.contains("ERR_ABORTED")
+}
+
 fn ref_for(result_text: &str, label: &str) -> Option<String> {
     // The tool result is pretty-printed JSON: parse it and scan the real
     // snapshot lines, which look like: - link "go to two" [ref=eN].
@@ -1219,9 +1352,18 @@ async fn real_no_steal_suite() {
     ];
 
     // Open the local page, snapshot, click the link by ref, land on /two.
-    let open = call(&root, "browser_open", serde_json::json!({"url": page}))
+    let mut open = call(&root, "browser_open", serde_json::json!({"url": page}))
         .await
         .expect("open");
+    // Cold start: the first command can meet a daemon that is not
+    // accepting yet (EAGAIN os error 35, reported as outcome_unknown).
+    // The helper never auto-retries those (the command may have run);
+    // the test re-issues once like a user, and the warm daemon lands it.
+    if is_error(&open) && transient_daemon_race(&text_of(&open)) {
+        open = call(&root, "browser_open", serde_json::json!({"url": page}))
+            .await
+            .expect("open retry");
+    }
     assert!(!is_error(&open), "open failed: {}", text_of(&open));
     let snapshot = call(&root, "browser_snapshot", serde_json::json!({}))
         .await
@@ -1314,10 +1456,13 @@ async fn real_no_steal_suite() {
                     serde_json::json!({"url": url, "tab": tab}),
                 )
                 .await;
-                // A navigation burst can abort one load; the helper reports
-                // it as a tool error and a single retry lands it.
+                // A navigation burst can abort one load, and a cold or
+                // loaded daemon can drop a response read (EAGAIN os error
+                // 35, outcome_unknown); the helper reports both as tool
+                // errors and never auto-retries, so a single re-issue
+                // lands them.
                 if let Ok(result) = &opened {
-                    if is_error(result) && text_of(result).contains("ERR_ABORTED") {
+                    if is_error(result) && transient_daemon_race(&text_of(result)) {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         opened = call(
                             &peer,

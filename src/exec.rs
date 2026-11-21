@@ -106,6 +106,24 @@ pub fn ensure_agent_browser_config(sock_dir: &Path) -> std::io::Result<PathBuf> 
     Ok(path)
 }
 
+/// True when an agent-browser failure proves the command never reached
+/// the daemon (connect-phase), so sending it once more cannot run it
+/// twice. Only `Failed to connect` qualifies: the CLI's `connect()` failed
+/// before a single byte was written (cold-start daemon race, N7: the CLI
+/// already respawns the daemon and retries once itself; this covers the
+/// leftover race where that retry also met a starting daemon). Everything
+/// else is excluded, even when it looks transient:
+/// - `outcome_unknown` / `Failed to read` / `Failed to send`: the request
+///   may have been written, so the daemon may have run it — retrying a
+///   mutating command (click twice, open twice) could double-execute.
+/// - timeouts and spawn errors: the CLI was killed mid-flight while the
+///   daemon may still be running the command.
+///
+/// Callers retry at most once on true, never on false.
+pub fn not_sent_to_daemon(message: &str) -> bool {
+    message.contains("Failed to connect") && !message.contains("outcome_unknown")
+}
+
 /// What a tool call produced: plain JSON or a PNG for MCP image content.
 #[derive(Debug)]
 pub enum ExecOutput {
@@ -772,6 +790,36 @@ pub fn shot_path(data_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_connect_phase_failures_retry() {
+        // Cold-start race the helper may retry once: connect() failed
+        // before a byte was written, so the daemon got nothing.
+        assert!(not_sent_to_daemon(
+            "agent-browser exited 1: stdout: {\"success\":false,\"error\":\"Failed to connect: Connection refused (os error 61)\"}"
+        ));
+        assert!(not_sent_to_daemon(
+            "window new: Failed to connect: No such file (os error 2)"
+        ));
+        // Post-send failures never retry: the command may have run.
+        assert!(!not_sent_to_daemon(
+            "open: {(os error 35)} outcome_unknown (the command reached the daemon but no response came back; it may or may not have run, so it was not retried)"
+        ));
+        assert!(!not_sent_to_daemon(
+            "open: agent-browser failed: Failed to read: EAGAIN"
+        ));
+        assert!(!not_sent_to_daemon(
+            "click: agent-browser failed: Failed to send: broken pipe"
+        ));
+        // Timeouts and spawn errors never retry: the daemon may still run it.
+        assert!(!not_sent_to_daemon(
+            "open: agent-browser timed out after 30s"
+        ));
+        assert!(!not_sent_to_daemon(
+            "open: cannot spawn agent-browser: missing binary"
+        ));
+        assert!(!not_sent_to_daemon("window new failed (injected)"));
+    }
 
     fn argv(tool: &str, args: Value) -> Vec<String> {
         tool_argv(
