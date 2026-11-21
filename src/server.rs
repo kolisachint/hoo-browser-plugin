@@ -603,16 +603,12 @@ impl Helper {
     ) -> Result<(String, std::time::Duration), HooError> {
         let agent_id = agent.agent_id.as_str();
         loop {
-            // N5: agentEnded may have removed the caller's token while a
-            // concurrent initializer worked. Re-check registration before
-            // (re)creating anything: a rolled-back lease (`None` below)
-            // must not come back for a dead agent.
-            if !self.inner.state.lock().await.tokens.contains_key(token) {
-                return Err(HooError::Refused(format!(
-                    "agent {agent_id} is no longer registered (agentEnded?)"
-                )));
-            }
-            let (session, fresh) = self.inner.state.lock().await.ensure(agent_id, tab)?;
+            // B5: the token check and the lease mutation share one guard
+            // inside `ensure`. N5 still holds: agentEnded may have removed
+            // the caller's token while a concurrent initializer worked,
+            // so the re-check after a rollback (`None` below) refuses a
+            // dead agent instead of resurrecting its tab.
+            let (session, fresh) = self.inner.state.lock().await.ensure(token, agent_id, tab)?;
             // Touch at call start (M7): the sweeper skips anything touched
             // within the idle window, so a call in flight is never reaped.
             let closing = {
@@ -1631,12 +1627,21 @@ mod tests {
             .expect("register");
         // A lease created before the end (still initializing, as if its
         // `window new` were in flight) goes away with agentEnded.
+        // B5: `ensure` takes the token, so the child token registers first.
+        helper.inner.state.lock().await.tokens.insert(
+            "child-token".into(),
+            AgentRecord {
+                agent_id: "root/task-1".into(),
+                parent_id: Some("root".into()),
+                depth: 1,
+            },
+        );
         let (session, _) = helper
             .inner
             .state
             .lock()
             .await
-            .ensure("root/task-1", 1)
+            .ensure("child-token", "root/task-1", 1)
             .expect("ensure");
         assert!(helper
             .inner

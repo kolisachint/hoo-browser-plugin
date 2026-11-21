@@ -238,7 +238,26 @@ impl State {
     /// Resolve tab N, creating the lease when N is exactly one past the end
     /// (a new tab). Returns the session plus whether it is fresh (the caller
     /// then runs `window new` so the lease gets its own window).
-    pub fn ensure(&mut self, agent_id: &str, tab: usize) -> Result<(String, bool), HooError> {
+    ///
+    /// Takes the caller's token and checks it against the tokens map
+    /// itself (B5), so the check and the mutation share one guard: a
+    /// token that never registered — or belongs to another agent — is
+    /// refused even mid-loop, after an abandon re-check.
+    pub fn ensure(
+        &mut self,
+        token: &str,
+        agent_id: &str,
+        tab: usize,
+    ) -> Result<(String, bool), HooError> {
+        if !self
+            .tokens
+            .get(token)
+            .is_some_and(|record| record.agent_id == agent_id)
+        {
+            return Err(HooError::Refused(format!(
+                "unknown token for agent '{agent_id}' (helper restarted?)"
+            )));
+        }
         if tab == 0 {
             return Err(HooError::Failed("tab numbers start at 1".into()));
         }
@@ -482,6 +501,18 @@ mod tests {
         state
     }
 
+    /// Register a scratch token for the agent and resolve a tab (B5:
+    /// `ensure` takes the token and checks it against the tokens map).
+    fn ensure(state: &mut State, agent: &str, tab: usize) -> Result<(String, bool), HooError> {
+        let token = format!("tok-{agent}");
+        state.tokens.entry(token.clone()).or_insert(AgentRecord {
+            agent_id: agent.into(),
+            parent_id: None,
+            depth: 0,
+        });
+        state.ensure(&token, agent, tab)
+    }
+
     #[test]
     fn registration_only_accepts_own_children() {
         let mut state = root_state();
@@ -618,17 +649,41 @@ mod tests {
     #[test]
     fn ensure_creates_in_order_and_enforces_limits() {
         let mut state = root_state();
-        let (s1, fresh) = state.ensure("root/task-1", 1).unwrap();
+        let (s1, fresh) = ensure(&mut state, "root/task-1", 1).unwrap();
         assert!(fresh && s1 == "root_task-1-1");
-        let (s1b, fresh) = state.ensure("root/task-1", 1).unwrap();
+        let (s1b, fresh) = ensure(&mut state, "root/task-1", 1).unwrap();
         assert!(!fresh && s1b == s1);
         // Skipping a tab is refused.
-        assert!(state.ensure("root/task-1", 3).is_err());
-        let (s2, fresh) = state.ensure("root/task-1", 2).unwrap();
+        assert!(ensure(&mut state, "root/task-1", 3).is_err());
+        let (s2, fresh) = ensure(&mut state, "root/task-1", 2).unwrap();
         assert!(fresh && s2 == "root_task-1-2");
-        state.ensure("root/task-1", 3).unwrap();
-        state.ensure("root/task-1", 4).unwrap();
-        assert!(state.ensure("root/task-1", 5).is_err());
+        ensure(&mut state, "root/task-1", 3).unwrap();
+        ensure(&mut state, "root/task-1", 4).unwrap();
+        assert!(ensure(&mut state, "root/task-1", 5).is_err());
+    }
+
+    #[test]
+    fn ensure_checks_the_token_under_the_same_guard() {
+        // B5: `ensure` takes the token and checks it against the tokens
+        // map itself, so refusals happen even mid-loop after a rollback.
+        let mut state = root_state();
+        // Unknown token is refused even for a tab that would otherwise open.
+        assert!(state.ensure("nope-token", "root/task-1", 1).is_err());
+        // A token registered for another agent is refused too.
+        state.tokens.insert(
+            "tok-a".into(),
+            AgentRecord {
+                agent_id: "a".into(),
+                parent_id: None,
+                depth: 0,
+            },
+        );
+        assert!(state.ensure("tok-a", "root/task-1", 1).is_err());
+        // The token's own agent resolves.
+        let (session, fresh) = state.ensure("tok-a", "a", 1).unwrap();
+        assert!(fresh && session == "a-1");
+        // The refusals created no leases.
+        assert_eq!(state.leases.len(), 1);
     }
 
     #[test]
@@ -636,19 +691,19 @@ mod tests {
         let mut state = root_state();
         for agent in 0..6 {
             for tab in 1..=4 {
-                state.ensure(&format!("agent-{agent}"), tab).unwrap();
+                ensure(&mut state, &format!("agent-{agent}"), tab).unwrap();
             }
         }
         assert_eq!(state.leases.len(), MAX_LEASES);
-        assert!(state.ensure("agent-new", 1).is_err());
+        assert!(ensure(&mut state, "agent-new", 1).is_err());
     }
 
     #[test]
     fn name_collisions_never_share_a_session() {
         let mut state = root_state();
         // "a/b" and "a_b" sanitize alike.
-        let (first, _) = state.ensure("a/b", 1).unwrap();
-        let (second, _) = state.ensure("a_b", 1).unwrap();
+        let (first, _) = ensure(&mut state, "a/b", 1).unwrap();
+        let (second, _) = ensure(&mut state, "a_b", 1).unwrap();
         assert_ne!(first, second);
     }
 
@@ -665,7 +720,7 @@ mod tests {
                 "child-token".into(),
             )
             .unwrap();
-        state.ensure("root/task-1", 1).unwrap();
+        ensure(&mut state, "root/task-1", 1).unwrap();
         let closed = state.remove_agent("root/task-1");
         assert_eq!(closed, vec!["root_task-1-1".to_owned()]);
         assert!(!state.tokens.contains_key("child-token"));
@@ -675,8 +730,8 @@ mod tests {
     #[test]
     fn adopt_moves_leases_to_root() {
         let mut state = root_state();
-        state.ensure("root/task-1", 1).unwrap();
-        state.ensure("root/task-1", 2).unwrap();
+        ensure(&mut state, "root/task-1", 1).unwrap();
+        ensure(&mut state, "root/task-1", 2).unwrap();
         state.adopt("root/task-1", "root").unwrap();
         assert_eq!(state.owned("root/task-1"), Vec::<String>::new());
         assert_eq!(state.owned("root").len(), 2);
@@ -688,27 +743,27 @@ mod tests {
     #[test]
     fn closing_a_tab_does_not_renumber_the_others() {
         let mut state = root_state();
-        let (s1, _) = state.ensure("root/task-1", 1).unwrap();
-        let (s2, _) = state.ensure("root/task-1", 2).unwrap();
+        let (s1, _) = ensure(&mut state, "root/task-1", 1).unwrap();
+        let (s2, _) = ensure(&mut state, "root/task-1", 2).unwrap();
         state.close("root/task-1", &s1).unwrap();
         // Tab 2 keeps its session; tab 1 resolves to nothing now.
         assert_eq!(state.resolve("root/task-1", 2).unwrap(), s2);
         assert!(state.resolve("root/task-1", 1).is_err());
         // Reopening tab 1 takes a fresh session in the same slot.
-        let (s1_new, fresh) = state.ensure("root/task-1", 1).unwrap();
+        let (s1_new, fresh) = ensure(&mut state, "root/task-1", 1).unwrap();
         assert!(fresh && s1_new == s1);
         assert_eq!(state.resolve("root/task-1", 2).unwrap(), s2);
         // The per-agent limit counts live tabs only: 2 live + reopen = 3.
-        state.ensure("root/task-1", 3).unwrap();
-        state.ensure("root/task-1", 4).unwrap();
-        assert!(state.ensure("root/task-1", 5).is_err());
+        ensure(&mut state, "root/task-1", 3).unwrap();
+        ensure(&mut state, "root/task-1", 4).unwrap();
+        assert!(ensure(&mut state, "root/task-1", 5).is_err());
     }
 
     #[test]
     fn sweeper_claims_only_untouched_leases() {
         use std::time::{Duration, Instant};
         let mut state = root_state();
-        let (s1, _) = state.ensure("a", 1).unwrap();
+        let (s1, _) = ensure(&mut state, "a", 1).unwrap();
         // Fresh (initializing) leases are never claimed.
         assert!(!state.try_claim_close(&s1, Instant::now()));
         state.mark_ready(&s1);
@@ -739,7 +794,7 @@ mod tests {
     #[test]
     fn close_is_owner_or_root_only() {
         let mut state = root_state();
-        state.ensure("root/task-1", 1).unwrap();
+        ensure(&mut state, "root/task-1", 1).unwrap();
         assert!(state.close("root/task-2", "root_task-1-1").is_err());
         state.close("root", "root_task-1-1").unwrap();
         assert!(state.leases.is_empty());
