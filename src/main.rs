@@ -177,9 +177,38 @@ async fn run() -> Result<(), HooError> {
         }
     });
 
+    // SIGTERM/SIGINT run the same fast shutdown (N1): the supervisor
+    // kills the helper on uninstall/upgrade, and the default disposition
+    // would kill only the helper, orphaning Chromium (stale profile lock)
+    // and the leases' windows. Killpg takes the browser tree first, the
+    // capped lease close keeps us under hoocode's ~2 s wait, and the exit
+    // code stays 0 so a plain stop is not reported as a crash.
+    let signaled = helper.clone();
+    tokio::spawn(watch_signals(signaled));
+
     // Idle leases close themselves; the Chromium child dies with us.
     tokio::spawn(server::sweep_loop(helper.clone()));
     server::serve(helper, socket).await
+}
+
+/// Wait for SIGTERM or SIGINT, then run the sessionEnding fast shutdown
+/// and exit 0. Installed alongside the parent-death watcher so every
+/// supervisor-initiated stop cleans up the same way.
+#[cfg(unix)]
+async fn watch_signals(helper: server::Helper) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        return;
+    };
+    let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+        return;
+    };
+    tokio::select! {
+        _ = term.recv() => {},
+        _ = interrupt.recv() => {},
+    }
+    helper.shutdown_fast().await;
+    std::process::exit(0);
 }
 
 #[cfg(test)]

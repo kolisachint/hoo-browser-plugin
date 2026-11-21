@@ -924,6 +924,103 @@ fn overhead_report_exists_after_fake_calls() {
 }
 
 // ---------------------------------------------------------------------------
+// Signals: SIGTERM/SIGINT run the same fast shutdown as sessionEnding.
+// ---------------------------------------------------------------------------
+
+/// Fake Chromium for the signal test: prints a DevTools endpoint line like
+/// the real browser, then sleeps, so there is a real process tree in its own
+/// process group for killpg to reap.
+fn fake_chrome(dir: &Path) -> PathBuf {
+    let path = dir.join("fake-chrome.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/bash\necho 'DevTools listening on ws://127.0.0.1:1/devtools/browser/fake' >&2\nexec sleep 300\n",
+    )
+    .expect("fake chrome");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    path
+}
+
+/// True while any process of the group still exists (signal 0 checks).
+#[cfg(unix)]
+fn pgid_alive(pgid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 sends nothing.
+    unsafe { libc::killpg(pgid, 0) == 0 }
+}
+
+#[tokio::test]
+async fn sigterm_shuts_down_fast_like_session_ending() {
+    // The real helper binary as a child, the way hoocode runs it: fake
+    // agent-browser plus a fake Chromium with a real process tree.
+    let dir = test_tmp("sigterm");
+    let socket = dir.join("helper.sock");
+    let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_hoo-browser"));
+    let mut child = tokio::process::Command::new(&helper_bin)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .env("HOOCODE_HELPER_SOCKET", &socket)
+        .env("HOOCODE_HELPER_TOKEN", ROOT_TOKEN)
+        .env("HOOCODE_AGENT_ID", "root")
+        .env("HOO_BROWSER_DATA", &dir)
+        .env(
+            "HOO_BROWSER_AGENT_BROWSER",
+            manifest_dir().join("tests/fake-agent-browser.sh"),
+        )
+        .env("HOO_BROWSER_CHROME", fake_chrome(&dir))
+        .env_remove("HOO_BROWSER_CALL_TIMEOUT_SECS")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn helper");
+    let helper_pid = child.id().expect("helper pid") as libc::pid_t;
+    wait_for_socket(&socket).await;
+    // Chromium's pid is recorded in the profile lock file (note_pids).
+    let lock_text = std::fs::read_to_string(dir.join("profile.lock")).expect("profile lock");
+    let chrome_pid: libc::pid_t = lock_text
+        .lines()
+        .find_map(|line| line.strip_prefix("chromium=").and_then(|v| v.parse().ok()))
+        .expect("chromium pid in lock");
+    // SAFETY: getpgid only reads.
+    let pgid = unsafe { libc::getpgid(chrome_pid) };
+    assert!(
+        pgid > 0 && pgid == chrome_pid,
+        "chromium must lead its own process group"
+    );
+    assert!(pgid_alive(pgid), "chromium tree alive before the signal");
+    // SAFETY: SIGTERM to our own test child.
+    unsafe {
+        libc::kill(helper_pid, libc::SIGTERM);
+    }
+    // Fast shutdown (N1): the group is gone, the socket is removed, and the
+    // helper exits 0 (a plain stop is not a crash).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let exited = child.try_wait().expect("wait");
+        if !pgid_alive(pgid) && !socket.exists() {
+            match exited {
+                Some(status) => {
+                    assert!(status.success(), "helper must exit 0, got {status}");
+                    return;
+                }
+                None => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        } else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SIGTERM shutdown stalled: group alive={}, socket exists={}",
+                pgid_alive(pgid),
+                socket.exists()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Real backend: real agent-browser + headless Chromium, behind HOO_BROWSER_IT.
 // ---------------------------------------------------------------------------
 

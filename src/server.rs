@@ -93,6 +93,10 @@ pub struct Inner {
     /// Profile lock file this helper holds, removed on shutdown (C3).
     /// `None` when the data profile was busy and we used the runtime one.
     pub profile_lock: Mutex<Option<crate::backend::ProfileLock>>,
+    /// Socket this helper serves on, set by `serve`. Every fast-shutdown
+    /// path (sessionEnding, parent death, SIGTERM/SIGINT) removes it so no
+    /// stale socket shadows the next helper.
+    pub socket_path: Mutex<Option<PathBuf>>,
 }
 
 impl Helper {
@@ -117,6 +121,7 @@ impl Helper {
                 sock_dir,
                 chromium: Mutex::new(None),
                 profile_lock: Mutex::new(None),
+                socket_path: Mutex::new(None),
             }),
         }
     }
@@ -146,11 +151,12 @@ impl Helper {
         let _ = self.inner.profile_lock.lock().await.take();
     }
 
-    /// Fast shutdown for sessionEnding and parent death (N1): kill the
-    /// browser tree FIRST, then close leases with a hard ~1 s cap, then
-    /// reap. hoocode waits ~2 s for us to exit; the 60 s close_all could
-    /// strand us past it. With the browser already dead, the lease closes
-    /// fail fast instead of hanging on a wedged daemon.
+    /// Fast shutdown for sessionEnding, parent death and signals (N1):
+    /// kill the browser tree FIRST, then close leases with a hard ~1 s
+    /// cap, then reap, then remove the socket. hoocode waits ~2 s for us
+    /// to exit; the 60 s close_all could strand us past it. With the
+    /// browser already dead, the lease closes fail fast instead of hanging
+    /// on a wedged daemon.
     pub async fn shutdown_fast(&self) {
         if let Some(child) = self.inner.chromium.lock().await.as_ref() {
             kill_tree(child);
@@ -158,6 +164,9 @@ impl Helper {
         self.close_all_capped(std::time::Duration::from_secs(1))
             .await;
         self.shutdown().await;
+        if let Some(path) = self.inner.socket_path.lock().await.clone() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// The agent record for a bearer token, if known.
@@ -447,6 +456,7 @@ where
 /// Serve the helper on the Unix socket; returns when the listener fails.
 pub async fn serve(helper: Helper, socket: PathBuf) -> Result<(), HooError> {
     let _ = std::fs::remove_file(&socket);
+    *helper.inner.socket_path.lock().await = Some(socket.clone());
     let listener = tokio::net::UnixListener::bind(&socket)
         .map_err(|e| HooError::Transport(format!("cannot bind {}: {e}", socket.display())))?;
     eprintln!("hoo-browser: listening on {}", socket.display());
