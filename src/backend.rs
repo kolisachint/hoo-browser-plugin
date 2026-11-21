@@ -247,9 +247,20 @@ pub fn socket_dir(runtime_dir: &Path) -> PathBuf {
 
 /// `mkdir -p` with 0700 and an owner check (M4): plugin-data dirs hold
 /// browsing state, so they must neither be world-readable nor owned by
-/// someone else. Pre-existing dirs are tightened, not just new ones.
+/// someone else. Pre-existing dirs are tightened, not just new ones. A
+/// symlink is refused outright: `metadata` would follow it and check (or
+/// chmod) the target, so `symlink_metadata` gates first.
 pub fn ensure_dir_0700(path: &Path) -> Result<(), HooError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(HooError::Usage(format!(
+            "{} is a symlink, refusing to use it as a data dir",
+            path.display()
+        )));
+    }
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -311,6 +322,7 @@ fn try_profile_lock(lock_path: &Path) -> Result<Option<ProfileLock>, HooError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)
         .map_err(|e| HooError::Usage(format!("cannot open {}: {e}", lock_path.display())))?;
     let start = std::time::Instant::now();
@@ -661,6 +673,21 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlinked_dirs_are_refused() {
+        let base = std::env::temp_dir().join(format!("hoo-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // Even though the target is a fine directory, the symlink itself
+        // is refused: metadata/chmod would follow it.
+        assert!(super::ensure_dir_0700(&link).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
