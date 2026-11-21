@@ -74,13 +74,12 @@ return "not yet supported", B4) or `HOO_BROWSER_HEADED=1`.
 
 ## Release
 
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-The release workflow builds the four platform binaries, uploads them, then
-opens a PR pinning their sha256s into `plugin/plugin.json` — merge that PR
-before anything else references the tag. Only after the release exists (assets
-uploaded, manifest PR merged) add the `hoo-browser` entry to hoo-plugins
+Label-driven: merge a PR labeled `cargo:patch` (or `cargo:minor` /
+`cargo:major`) and the release workflow bumps the version, builds the four
+platform binaries as plain files, pins their sha256s into
+`plugin/plugin.json`, commits that on main (`release: v<x.y.z>`), tags and
+releases — no manual steps. Manual retry: Actions → release → Run workflow
+→ bump `patch`|`minor`|`major`. Only after the release exists (assets
+uploaded, release commit on main) add the `hoo-browser` entry to hoo-plugins
 (git-subdir, path `plugin`): the marketplace pins the tag, and a listing
 merged earlier would resolve URLs and sha256s that do not exist yet.

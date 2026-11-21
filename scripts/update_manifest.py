@@ -10,7 +10,7 @@ Usage:
   # from release assets (needs `gh`):
   scripts/update_manifest.py --version 0.1.0 --from-release
 
-The release workflow runs this and opens the manifest PR itself; humans use
+The release workflow runs this and commits the pins itself; humans use
 it the same way when cutting a release by hand.
 """
 import argparse
