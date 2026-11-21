@@ -827,14 +827,31 @@ impl Helper {
                     .lock()
                     .await
                     .resolve(&agent.agent_id, tab)?;
-                // The lease's window/tab goes first (H4, best effort),
-                // then `close`, whose failure the caller sees.
-                let tab_close = self.session_argv(&session, &["tab", "close"]);
-                let call_started = std::time::Instant::now();
-                if let Ok(timeout) = exec::spawn_timeout(deadline) {
-                    let _ = exec::run_command(&tab_close, timeout, &self.inner.sock_dir).await;
+                // H4: `tab close` refuses the last tab over `--cdp` and
+                // `close` only disconnects, so close the lease's bound tab
+                // via the DevTools HTTP endpoint first, then `close` the
+                // session. Only the `active` (bound) tab is closed: the
+                // session's list shows the whole shared browser, so closing
+                // every listed target would take other leases' pages with
+                // it. The DevTools close is the helper's own localhost
+                // HTTP, not child time. The list phase is capped well under
+                // the call budget so a wedged daemon cannot eat the `close`
+                // itself: a failed list just skips the DevTools step.
+                if let Ok(list_timeout) = exec::spawn_timeout(deadline) {
+                    let list_timeout = list_timeout.min(std::time::Duration::from_secs(15));
+                    let list_started = std::time::Instant::now();
+                    let list = self.session_argv(&session, &["tab", "list"]);
+                    if let Ok(data) =
+                        exec::run_command(&list, list_timeout, &self.inner.sock_dir).await
+                    {
+                        if let Some(target) = lease_bound_target(&data) {
+                            if let Some(authority) = cdp_authority(&self.inner.cdp) {
+                                devtools_close_target(&authority, &target).await;
+                            }
+                        }
+                    }
+                    child += list_started.elapsed();
                 }
-                child += call_started.elapsed();
                 let argv = exec::tool_argv(
                     &self.inner.agent_browser,
                     &self.inner.cdp,
@@ -897,17 +914,123 @@ impl Helper {
 
     /// Close one agent-browser session, best effort (sweeper/agentEnded).
     ///
-    /// `window` has no close verb upstream, so the lease's window/tab goes
-    /// first (`tab close` drops the session's tabs on the shared browser),
-    /// then `close` ends the session itself (H4). Either step failing leaves
-    /// the shared browser untouched for the other leases.
+    /// Over `--cdp` `tab close` refuses the last tab and `close` only
+    /// disconnects the session, so neither removes the lease's page from
+    /// the shared browser (H4). Close the lease's bound tab through the
+    /// DevTools HTTP endpoint on the helper's own Chromium, then `close`
+    /// the session itself.
     async fn close_session(&self, session: &str) {
-        let tab_close = self.session_argv(session, &["tab", "close"]);
-        let _ = exec::run_command(&tab_close, exec::call_timeout(), &self.inner.sock_dir).await;
+        // H4: over `--cdp` agent-browser's `tab close` refuses the last
+        // tab and `close` only disconnects the session, so neither removes
+        // the lease's pages from the shared browser. List the lease's own
+        // targets and close each through the DevTools HTTP endpoint on the
+        // helper's own Chromium (`GET /json/close/<targetId>`), then
+        // `close` the session itself. All best effort: the process exits.
+        let list = self.session_argv(session, &["tab", "list"]);
+        if let Ok(data) = exec::run_command(&list, exec::call_timeout(), &self.inner.sock_dir).await
+        {
+            if let Some(target) = lease_bound_target(&data) {
+                if let Some(authority) = cdp_authority(&self.inner.cdp) {
+                    devtools_close_target(&authority, &target).await;
+                }
+            }
+        }
         let close = self.session_argv(session, &["close"]);
         let _ = exec::run_command(&close, exec::call_timeout(), &self.inner.sock_dir).await;
     }
+}
 
+/// `ws://127.0.0.1:9222/devtools/...` -> `127.0.0.1:9222` for the DevTools
+/// HTTP endpoint (H4). The helper launched Chromium itself, so the port in
+/// its own `--cdp` value is the browser's port.
+fn cdp_authority(cdp: &str) -> Option<String> {
+    let bare = cdp
+        .strip_prefix("ws://")
+        .or_else(|| cdp.strip_prefix("wss://"))?;
+    let authority = bare.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority.to_owned())
+}
+
+/// The lease's bound tab from a `tab list --json` envelope: the entry the
+/// session marks `active` is the tab agent-browser runs the session on
+/// (probed: each session's list shows the whole shared browser, but exactly
+/// its own tab is active). Only that target is provably the lease's, so
+/// only it is closed here — never another lease's pages.
+fn lease_bound_target(data: &Value) -> Option<String> {
+    data.get("tabs").and_then(Value::as_array).and_then(|tabs| {
+        tabs.iter()
+            .filter(|tab| tab.get("active").and_then(Value::as_bool).unwrap_or(false))
+            .filter_map(|tab| tab.get("targetId").and_then(Value::as_str))
+            .map(str::to_owned)
+            .next()
+    })
+}
+
+/// Close one page target through the DevTools HTTP endpoint (H4):
+/// `GET /json/close/<targetId>`. Frame the reply by Content-Length: the
+/// DevTools server keep-alives HTTP/1.1 connections despite
+/// `Connection: close`, so read-until-EOF would stall to the timeout on
+/// every target. Best effort with a short cap — a wedged browser must not
+/// stall lease closing; the `close` after it still drops the session.
+async fn devtools_close_target(authority: &str, target_id: &str) {
+    let work = async {
+        let mut stream = tokio::net::TcpStream::connect(authority)
+            .await
+            .map_err(|_| ())?;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let request = format!(
+            "GET /json/close/{target_id} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.map_err(|_| ())?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return Err(()),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > 65536 {
+                        return Err(());
+                    }
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                }
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let len: usize = headers
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+            })
+            .next()
+            .flatten()
+            .unwrap_or(0);
+        let mut have = buf.len() - header_end;
+        while have < len {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    have += n;
+                    if have > 1_000_000 {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok::<(), ()>(())
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), work).await;
+}
+
+impl Helper {
     /// Close every lease (bounded concurrency) before killing Chromium (H3):
     /// sessionEnding and parent death must not strand windows on the shared
     /// browser. Best effort with an overall cap; the process exits next.
@@ -1130,6 +1253,76 @@ mod tests {
             "root-token".into(),
             "root".into(),
         )
+    }
+
+    #[test]
+    fn cdp_authority_takes_the_browser_port() {
+        assert_eq!(
+            cdp_authority("ws://127.0.0.1:9222/devtools/browser/abc").as_deref(),
+            Some("127.0.0.1:9222")
+        );
+        assert_eq!(
+            cdp_authority("wss://127.0.0.1:1/x").as_deref(),
+            Some("127.0.0.1:1")
+        );
+        assert_eq!(cdp_authority("http://127.0.0.1:9222/x"), None);
+        assert_eq!(cdp_authority("ws://"), None);
+        assert_eq!(cdp_authority(""), None);
+    }
+
+    #[test]
+    fn lease_bound_target_is_the_active_tab() {
+        // The session's list shows the whole shared browser; exactly its
+        // own (bound) tab is active, and only that target may be closed.
+        let data = serde_json::json!({"tabs": [
+            {"tabId": "t1", "targetId": "AAA", "active": false},
+            {"tabId": "t2", "targetId": "BBB", "active": true},
+            {"tabId": "t3", "targetId": "CCC"},
+        ]});
+        assert_eq!(lease_bound_target(&data).as_deref(), Some("BBB"));
+        assert_eq!(lease_bound_target(&serde_json::json!({"tabs": []})), None);
+        assert_eq!(lease_bound_target(&serde_json::json!({})), None);
+        // No active tab (a gone binding): nothing to close.
+        let data = serde_json::json!({"tabs": [
+            {"tabId": "t1", "targetId": "AAA", "active": false},
+        ]});
+        assert_eq!(lease_bound_target(&data), None);
+    }
+
+    #[tokio::test]
+    async fn devtools_close_hits_json_close_for_the_target() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let authority = listener.local_addr().expect("addr").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 1024];
+            let n = stream.read(&mut buf).await.expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"closed\":1}")
+                .await;
+            // Keep the connection open like the real DevTools server
+            // (keep-alive despite `Connection: close`): the client must
+            // return from the framed body, not from EOF.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            request
+        });
+        let started = std::time::Instant::now();
+        devtools_close_target(&authority, "TARGET-9").await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the close must return from the framed body, not EOF/timeout"
+        );
+        let request = server.await.expect("server");
+        assert!(
+            request.starts_with("GET /json/close/TARGET-9 "),
+            "must close the target over DevTools HTTP, got: {request}"
+        );
+        // An unreachable browser never stalls the close (5 s cap, best effort).
+        devtools_close_target("127.0.0.1:1", "TARGET-9").await;
     }
 
     #[tokio::test]

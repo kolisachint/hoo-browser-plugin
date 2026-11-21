@@ -659,6 +659,51 @@ async fn fake_closing_a_tab_keeps_the_others() {
 }
 
 #[tokio::test]
+async fn fake_close_lists_targets_before_closing_the_session() {
+    // H4: closing a lease must close every page target the lease owns:
+    // the helper lists the lease's targets (`tab list`) and only then
+    // `close`s the session. `tab close` refuses the last tab over --cdp,
+    // so it must never be the close path.
+    let dir = test_tmp("closetargets");
+    let argv_log = dir.join("argv.log");
+    let fake = fake_wrapper(&dir, &argv_log, None);
+    let (helper, socket) = start_helper(&fake, &dir).await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
+    let child = connect(&socket, "child-1-token").await;
+    call(
+        &child,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    let before = argv_lines(&argv_log).len();
+    let closed = call(
+        &child,
+        "browser_tabs",
+        serde_json::json!({"action": "close", "tab": 1}),
+    )
+    .await
+    .expect("close tab 1");
+    assert!(!is_error(&closed), "close failed: {}", text_of(&closed));
+    let calls: Vec<String> = argv_lines(&argv_log)[before..].to_vec();
+    let list_at = calls
+        .iter()
+        .position(|l| l.contains("--session root_task-1-1") && l.contains(" tab list"))
+        .expect("close must list the lease targets first");
+    let close_at = calls
+        .iter()
+        .position(|l| l.contains("--session root_task-1-1") && l.trim_end().ends_with(" close"))
+        .expect("close must end with `close` for the session");
+    assert!(list_at < close_at, "tab list must precede close: {calls:?}");
+    assert!(
+        !calls.iter().any(|l| l.contains(" tab close")),
+        "`tab close` refuses the last tab, never use it: {calls:?}"
+    );
+}
+
+#[tokio::test]
 async fn fake_spawn_and_timeout_failures_are_tool_errors() {
     // No such binary: the spawn fails and the model sees a tool error.
     let dir = test_tmp("spawnfail");
@@ -1173,6 +1218,34 @@ async fn real_no_steal_suite() {
             text_of(&href)
         );
     }
+
+    // H4: `browser_tabs close` closes the lease's windows too: the
+    // DevTools /json endpoint loses at least one page target.
+    let pages_full = cdp_page_targets(&endpoint).await;
+    let closed_tab = call(
+        &children[0],
+        "browser_tabs",
+        serde_json::json!({"action": "close", "tab": 2}),
+    )
+    .await
+    .expect("close tab");
+    assert!(
+        !is_error(&closed_tab),
+        "browser_tabs close failed: {}",
+        text_of(&closed_tab)
+    );
+    let mut pages_closed = pages_full;
+    for _ in 0..50 {
+        pages_closed = cdp_page_targets(&endpoint).await;
+        if pages_closed < pages_full {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        pages_closed < pages_full,
+        "browser_tabs close must close windows too: {pages_closed} vs {pages_full} page targets"
+    );
 
     // Cross-agent access is refused over the CLI fallback too.
     let cross = call(
