@@ -414,6 +414,19 @@ fn unauthorized_response() -> Response<BoxBody<Bytes, Infallible>> {
 #[derive(Clone, Copy)]
 struct RequestStarted(std::time::Instant);
 
+/// Request entry instant for the overhead log. The auth layer stamps
+/// `RequestStarted` into the HTTP request extensions, but rmcp puts the
+/// whole `http::request::Parts` into `context.extensions` — so the stamp
+/// reads back through the `Parts`, not directly (B2: a direct
+/// `get::<RequestStarted>()` is always `None`).
+fn request_started(extensions: &rmcp::model::Extensions) -> std::time::Instant {
+    extensions
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<RequestStarted>())
+        .map(|started| started.0)
+        .unwrap_or_else(std::time::Instant::now)
+}
+
 #[derive(Clone)]
 struct AuthService<S> {
     helper: Helper,
@@ -1195,13 +1208,11 @@ impl ServerHandler for Helper {
             .agent_for(&token)
             .await
             .ok_or_else(|| refused("unknown token"))?;
-        // M5: the auth layer stamped request entry; fall back to now only
-        // when the stamp is missing (direct in-process callers in tests).
-        let started = context
-            .extensions
-            .get::<RequestStarted>()
-            .map(|stamped| stamped.0)
-            .unwrap_or_else(std::time::Instant::now);
+        // M5: the auth layer stamped request entry (read back through
+        // the `Parts` wrapper rmcp puts in the context extensions, B2);
+        // fall back to now only when the stamp is missing (direct
+        // in-process callers in tests).
+        let started = request_started(&context.extensions);
         let name = request.name.as_ref();
         if !DECLARED_TOOLS.iter().any(|(n, _)| *n == name) && name != "browser_cli" {
             return Err(ErrorData::new(
@@ -1335,6 +1346,31 @@ mod tests {
             "root-token".into(),
             "root".into(),
         )
+    }
+
+    #[test]
+    fn overhead_stamp_reads_through_the_parts_wrapper() {
+        // M5 stamps the HTTP request extensions; rmcp then wraps the whole
+        // `Parts` as one context extension. The stamp must be found through
+        // it (B2): a direct `get::<RequestStarted>()` on the context
+        // extensions is always `None`.
+        let at = std::time::Instant::now() - std::time::Duration::from_secs(7);
+        let mut request = http::Request::builder().body(()).expect("request");
+        request.extensions_mut().insert(RequestStarted(at));
+        let (parts, _) = request.into_parts();
+        // Direct lookup (the old, broken read) finds nothing …
+        let mut wrapped = rmcp::model::Extensions::new();
+        wrapped.insert(parts);
+        assert!(wrapped.get::<RequestStarted>().is_none());
+        // … while the Parts read finds the exact stamp.
+        let found = request_started(&wrapped);
+        assert!(
+            found.elapsed() >= std::time::Duration::from_secs(7),
+            "the entry stamp must survive the Parts wrapper"
+        );
+        // Missing stamp (direct in-process callers) falls back to now.
+        let fallback = request_started(&rmcp::model::Extensions::new());
+        assert!(fallback.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
