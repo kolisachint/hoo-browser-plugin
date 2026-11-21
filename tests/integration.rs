@@ -1138,49 +1138,208 @@ async fn fake_browser_cli_tab_follows_the_mode() {
     );
 }
 
-#[tokio::test]
-async fn fake_close_lists_targets_before_closing_the_session() {
-    // H4: closing a lease must close every page target the lease owns:
-    // the helper lists the lease's targets (`tab list`) and only then
-    // `close`s the session. `tab close` refuses the last tab over --cdp,
-    // so it must never be the close path.
-    let dir = test_tmp("closetargets");
+/// Spawn the real helper binary as a child (the way hoocode runs it),
+/// with the mode forced via the child's own env (`HOO_BROWSER_AB_SCOPED`
+/// `1` scoped, `0` safe). Never touches process env: parallel tests
+/// share it. The fake Chromium prints the fake DevTools endpoint so
+/// closes are observable.
+async fn spawn_mode_helper(
+    dir_tag: &str,
+    ab_scoped: &str,
+) -> (
+    tokio::process::Child,
+    PathBuf,
+    PathBuf,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+    PathBuf,
+) {
+    let dir = test_tmp(dir_tag);
     let argv_log = dir.join("argv.log");
     let fake = fake_wrapper(&dir, &argv_log, None, None);
-    let (helper, socket) = start_helper(&fake, &dir).await;
-    let root = connect(&socket, ROOT_TOKEN).await;
-    notify_started_child(&helper, &root, "root/task-1", "child-1-token").await;
-    let child = connect(&socket, "child-1-token").await;
-    call(
-        &child,
-        "browser_open",
-        serde_json::json!({"url": "https://x.example/"}),
+    let (cdp, closed, devtools) = fake_devtools().await;
+    let chrome = dir.join("fake-chrome.sh");
+    std::fs::write(
+        &chrome,
+        format!("#!/bin/bash\necho 'DevTools listening on {cdp}' >&2\nexec sleep 300\n"),
     )
-    .await
-    .expect("open");
-    let before = argv_lines(&argv_log).len();
-    let closed = call(
-        &child,
-        "browser_tabs",
-        serde_json::json!({"action": "close", "tab": 1}),
-    )
-    .await
-    .expect("close tab 1");
-    assert!(!is_error(&closed), "close failed: {}", text_of(&closed));
-    let calls: Vec<String> = argv_lines(&argv_log)[before..].to_vec();
-    let list_at = calls
-        .iter()
-        .position(|l| l.contains("--session root_task-1-1") && l.contains(" tab list"))
-        .expect("close must list the lease targets first");
-    let close_at = calls
-        .iter()
-        .position(|l| l.contains("--session root_task-1-1") && l.trim_end().ends_with(" close"))
-        .expect("close must end with `close` for the session");
-    assert!(list_at < close_at, "tab list must precede close: {calls:?}");
-    assert!(
-        !calls.iter().any(|l| l.contains(" tab close")),
-        "`tab close` refuses the last tab, never use it: {calls:?}"
-    );
+    .expect("fake chrome");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&chrome, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let socket = dir.join("helper.sock");
+    let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_hoo-browser"));
+    let child = tokio::process::Command::new(&helper_bin)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .env("HOOCODE_HELPER_SOCKET", &socket)
+        .env("HOOCODE_HELPER_TOKEN", ROOT_TOKEN)
+        .env("HOOCODE_AGENT_ID", "root")
+        .env("HOO_BROWSER_DATA", &dir)
+        .env("HOO_BROWSER_AGENT_BROWSER", &fake)
+        .env("HOO_BROWSER_CHROME", &chrome)
+        .env("HOO_BROWSER_AB_SCOPED", ab_scoped)
+        .env_remove("HOO_BROWSER_CALL_TIMEOUT_SECS")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn helper");
+    wait_for_socket(&socket).await;
+    (child, socket, argv_log, closed, devtools, dir)
+}
+
+/// Stop a spawned mode helper and its fake-Chromium tree (best effort):
+/// SIGTERM first so the helper runs its fast shutdown, then SIGKILL,
+/// then the browser group via the pid in the profile lock.
+async fn stop_mode_helper(child: &mut tokio::process::Child, dir: &Path) {
+    if let Some(pid) = child.id() {
+        // SAFETY: SIGTERM to our own test child.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if child.try_wait().expect("wait").is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let lock_text = std::fs::read_to_string(dir.join("profile.lock")).unwrap_or_default();
+    if let Some(pid) = lock_text.lines().find_map(|line| {
+        line.strip_prefix("chromium=")
+            .and_then(|v| v.parse::<libc::pid_t>().ok())
+    }) {
+        // SAFETY: SIGKILL to the fake browser tree only.
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                let _ = libc::killpg(pid, libc::SIGKILL);
+            } else {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fake_close_lists_targets_before_closing_the_session() {
+    // H4 close path per mode (B3), through a spawned helper child with
+    // the mode forced in its own env:
+    // - scoped (`HOO_BROWSER_AB_SCOPED=1`): `tab list` is already
+    //   owned-only, so a close lists the lease's targets first, closes
+    //   every listed target via DevTools, and only then `close`s.
+    // - safe (`=0`): the shared `tab list` shows every lease's tabs, so
+    //   the close takes only the bound target recorded at window open —
+    //   no list first (a wedged daemon must not skip the only close),
+    //   then `close`s. The bound target goes through the fake DevTools
+    //   endpoint the fake Chromium advertises.
+    // Either way `tab close` refuses the last tab over --cdp, so it must
+    // never be the close path.
+    for (mode, flag) in [("scoped", "1"), ("safe", "0")] {
+        let (mut child, socket, argv_log, closed, devtools, dir) =
+            spawn_mode_helper(&format!("closetargets-{mode}"), flag).await;
+        let root = connect(&socket, ROOT_TOKEN).await;
+        send_started(&root, "root/task-1", "root", 1, "child-1-token").await;
+        // Registration races the first connect: an unknown token is a
+        // fast 401, so retry until the helper knows us.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let child_peer = loop {
+            match try_connect(&socket, "child-1-token").await {
+                Ok(peer) => break peer,
+                Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{mode}: child never registered"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let opened = loop {
+            match call(
+                &child_peer,
+                "browser_open",
+                serde_json::json!({"url": "https://x.example/"}),
+            )
+            .await
+            {
+                Ok(result) => break result,
+                Err(e) if e.contains("unknown token") => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{mode}: child lost its registration"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("{mode}: protocol error: {e}"),
+            }
+        };
+        assert!(
+            !is_error(&opened),
+            "{mode}: open failed: {}",
+            text_of(&opened)
+        );
+        // Open-time binding (safe) performs no DevTools close; clear any
+        // hits so the assertions below see only the tab close.
+        closed.lock().unwrap().clear();
+        let before = argv_lines(&argv_log).len();
+        let done = call(
+            &child_peer,
+            "browser_tabs",
+            serde_json::json!({"action": "close", "tab": 1}),
+        )
+        .await
+        .expect("{mode}: close tab 1");
+        assert!(!is_error(&done), "{mode}: close failed: {}", text_of(&done));
+        let calls: Vec<String> = argv_lines(&argv_log)[before..].to_vec();
+        let close_at = calls
+            .iter()
+            .position(|l| l.contains("--session root_task-1-1") && l.trim_end().ends_with(" close"))
+            .expect("{mode}: close must end with `close`: {calls:?}");
+        if flag == "1" {
+            let list_at = calls
+                .iter()
+                .position(|l| l.contains("--session root_task-1-1") && l.contains(" tab list"))
+                .expect("{mode}: close must list the lease targets first: {calls:?}");
+            assert!(
+                list_at < close_at,
+                "{mode}: tab list must precede close: {calls:?}"
+            );
+            let got = closed.lock().unwrap().clone();
+            assert_eq!(
+                got,
+                vec![
+                    "/json/close/TGT-root_task-1-1".to_owned(),
+                    "/json/close/TGT-other".to_owned()
+                ],
+                "{mode}: scoped close takes every listed target: {got:?}"
+            );
+        } else {
+            assert!(
+                !calls.iter().any(|l| l.contains(" tab list")),
+                "{mode}: safe close lists nothing before `close`: {calls:?}"
+            );
+            let got = closed.lock().unwrap().clone();
+            assert_eq!(
+                got,
+                vec!["/json/close/TGT-root_task-1-1".to_owned()],
+                "{mode}: safe close takes only the bound target: {got:?}"
+            );
+        }
+        assert!(
+            !calls.iter().any(|l| l.contains(" tab close")),
+            "{mode}: `tab close` refuses the last tab, never use it: {calls:?}"
+        );
+        stop_mode_helper(&mut child, &dir).await;
+        devtools.abort();
+    }
 }
 
 #[tokio::test]

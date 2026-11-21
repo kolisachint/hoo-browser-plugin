@@ -1105,30 +1105,44 @@ impl Helper {
     /// belong to another lease — and skips the step when it is unknown.
     /// A failed list just skips the DevTools step.
     async fn close_lease_targets(&self, session: &str) {
-        let list = self.session_argv(session, &["tab", "list"]);
-        let timeout = exec::call_timeout().min(std::time::Duration::from_secs(15));
-        let Ok(data) = exec::run_command(
-            &list,
-            timeout,
-            &self.inner.sock_dir,
-            &self.inner.agent_browser_config,
-        )
-        .await
-        else {
-            return;
-        };
+        let bound = self
+            .inner
+            .state
+            .lock()
+            .await
+            .leases
+            .get(session)
+            .and_then(|lease| lease.bound_target.clone());
+        self.close_lease_targets_for(session, bound).await;
+    }
+
+    /// DevTools close with an explicit bound target (safe mode). The
+    /// `agentEnded` path snapshots bounds BEFORE `remove_agent` drops the
+    /// leases: looking the bound up after removal always yields `None` and
+    /// silently skips the only close safe mode performs (the live `active`
+    /// flag is never used — it may belong to another lease). Scoped mode
+    /// ignores the bound and closes every owned target from `tab list`.
+    async fn close_lease_targets_for(&self, session: &str, bound: Option<String>) {
+        // Safe mode needs no list: the bound target is already known, and
+        // gating the only close on an unrelated `tab list` would skip it
+        // whenever the daemon is wedged. Scoped mode lists first (the fork
+        // scopes it to owned tabs); a failed list skips the step.
         let targets: Vec<String> = if self.is_scoped() {
+            let list = self.session_argv(session, &["tab", "list"]);
+            let timeout = exec::call_timeout().min(std::time::Duration::from_secs(15));
+            let Ok(data) = exec::run_command(
+                &list,
+                timeout,
+                &self.inner.sock_dir,
+                &self.inner.agent_browser_config,
+            )
+            .await
+            else {
+                return;
+            };
             lease_targets(&data)
         } else {
-            self.inner
-                .state
-                .lock()
-                .await
-                .leases
-                .get(session)
-                .and_then(|lease| lease.bound_target.clone())
-                .into_iter()
-                .collect()
+            bound.into_iter().collect()
         };
         let Some(authority) = cdp_authority(&self.inner.cdp) else {
             return;
@@ -1146,13 +1160,27 @@ impl Helper {
     /// DevTools HTTP endpoint on the helper's own Chromium, then `close`
     /// the session itself.
     async fn close_session(&self, session: &str) {
+        let bound = self
+            .inner
+            .state
+            .lock()
+            .await
+            .leases
+            .get(session)
+            .and_then(|lease| lease.bound_target.clone());
+        self.close_session_with_bound(session, bound).await;
+    }
+
+    /// Close with an explicit bound target (safe mode): the caller
+    /// snapshotted it before the lease left the state map.
+    async fn close_session_with_bound(&self, session: &str, bound: Option<String>) {
         // H4: over `--cdp` agent-browser's `tab close` refuses the last
         // tab and `close` only disconnects the session, so neither removes
         // the lease's pages from the shared browser. Close the lease's
         // targets through the DevTools HTTP endpoint on the helper's own
         // Chromium (`GET /json/close/<targetId>`), then `close` the
         // session itself. All best effort: the process exits.
-        self.close_lease_targets(session).await;
+        self.close_lease_targets_for(session, bound).await;
         let close = self.session_argv(session, &["close"]);
         let _ = exec::run_command(
             &close,
@@ -1302,23 +1330,22 @@ impl Helper {
     }
 
     async fn close_all_capped(&self, cap: std::time::Duration) {
-        let sessions: Vec<String> = self
-            .inner
-            .state
-            .lock()
-            .await
-            .leases
-            .keys()
-            .cloned()
-            .collect();
+        let sessions: Vec<(String, Option<String>)> = {
+            let state = self.inner.state.lock().await;
+            state
+                .leases
+                .iter()
+                .map(|(session, lease)| (session.clone(), lease.bound_target.clone()))
+                .collect()
+        };
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
         let mut set = tokio::task::JoinSet::new();
-        for session in sessions {
+        for (session, bound) in sessions {
             let this = self.clone();
             let semaphore = semaphore.clone();
             set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await;
-                this.close_session(&session).await;
+                this.close_session_with_bound(&session, bound).await;
             });
         }
         let _ = tokio::time::timeout(cap, set.join_all()).await;
@@ -1525,9 +1552,32 @@ impl ServerHandler for Helper {
                 {
                     return;
                 }
-                let sessions = self.inner.state.lock().await.remove_agent(agent_id);
-                for session in sessions {
-                    self.close_session(&session).await;
+                // Snapshot safe-mode bounds BEFORE `remove_agent` drops the
+                // leases: `close_lease_targets` looks the bound up in the
+                // state map, so closing after removal would always find
+                // `None` and silently keep the ended agent's windows (safe
+                // mode's only close). Scoped mode ignores the snapshot and
+                // closes every owned target from `tab list`.
+                let ended: Vec<(String, Option<String>)> = {
+                    let state = self.inner.state.lock().await;
+                    state
+                        .order
+                        .get(agent_id)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|session| {
+                            state
+                                .leases
+                                .get(&session)
+                                .map(|lease| (session.clone(), lease.bound_target.clone()))
+                        })
+                        .collect()
+                };
+                self.inner.state.lock().await.remove_agent(agent_id);
+                for (session, bound) in ended {
+                    self.close_session_with_bound(&session, bound).await;
                 }
             }
             "hoocode/sessionEnding" => {
