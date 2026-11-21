@@ -24,6 +24,15 @@ if [ -n "${FAKE_ENV_LOG:-}" ]; then
     printf '%s\n' "${AGENT_BROWSER_CONFIG:-<unset>}" >> "$FAKE_ENV_LOG"
 fi
 
+# Version probe: the helper detects the fork by "-hoo." in this output
+# (fork releases carry versions like 0.43.1-hoo.1); upstream has none.
+for a in "$@"; do
+    if [ "$a" = "--version" ]; then
+        printf 'agent-browser %s\n' "${FAKE_VERSION:-0.43.0}"
+        exit 0
+    fi
+done
+
 # Drop globals (--cdp/--session and their values, --json/--pin-tab) so only
 # the command remains. The session is captured for the fail hook.
 args=()
@@ -71,7 +80,11 @@ case "$cmd" in
             && [ -f "$FAKE_FAIL_ONCE_DIR/$session" ]; then
             text=$(cat "$FAKE_FAIL_ONCE_DIR/$session")
             rm -f "$FAKE_FAIL_ONCE_DIR/$session"
-            fail "$text"
+            # Valid `--json` envelope like the real CLI prints (it exits
+            # 1 with `{"success":false,"error": …}` on stdout): the
+            # helper may only retry when `error` carries the client
+            # connect prefix.
+            fail "$(jstr "$text")"
             exit 1
         fi
         if [ -n "${FAKE_FAIL_FILE:-}" ] && [ -f "$FAKE_FAIL_FILE" ] \
@@ -110,6 +123,15 @@ case "$cmd" in
     "close") ok '{"closed":true}' ;;
     "wait") ok '{"state":"done"}' ;;
     "back"|"forward"|"reload") ok '{}' ;;
-    "eval") ok '{"result":"fake"}' ;;
+    "eval")
+        # B1: a daemon-reported page error whose text starts with the
+        # connect prefix (exit 0, like the real daemon wrapping a page
+        # JS failure) must surface, never retry.
+        if [ "${rest[0]:-}" = "FAILCONNECT-PAGE" ]; then
+            printf '{"success":false,"data":null,"error":"Failed to connect: simulated page error"}\n'
+        else
+            ok '{"result":"fake"}'
+        fi
+        ;;
     *) fail '"unknown command"' ;;
 esac

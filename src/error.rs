@@ -20,6 +20,11 @@ pub enum HooError {
     /// An authorization rule refused the call (wrong agent, unknown token).
     /// Maps to an MCP protocol error, never a tool result.
     Refused(String),
+    /// The agent-browser CLI never sent the command: its client-side
+    /// connect failed before a byte reached the daemon (B1, cold-start
+    /// race). Safe to send once more; callers retry at most once on this
+    /// and surface it as a tool error when the retry also fails.
+    NotSent(String),
     /// A tool-level failure: bad arguments, limits, spawn problems, or
     /// agent-browser answering `{"success": false}`. Maps to an MCP
     /// `isError` result so the model sees it and can react.
@@ -39,6 +44,9 @@ impl fmt::Display for HooError {
             | Self::Spawn(message)
             | Self::Refused(message)
             | Self::Failed(message)
+            // Same rendering as `Failed`: the model sees the message;
+            // the variant only decides the retry, never the text.
+            | Self::NotSent(message)
             | Self::Transport(message) => write!(f, "{message}"),
         }
     }

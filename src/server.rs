@@ -526,19 +526,20 @@ impl Helper {
     }
 
     /// Run one lease-scoped CLI call for a tool call, retrying once when
-    /// the failure proves the command never reached the daemon
-    /// (connect-phase cold-start race, N7): the second attempt's CLI
-    /// finds the started daemon. Never retries outcome_unknown, timeouts
-    /// or post-send failures — the command may have run, and re-sending a
-    /// mutating command could double-execute. Close/shutdown paths must
-    /// not use this: they stay single-shot and bounded.
+    /// the failure proves the command never reached the daemon (B1:
+    /// `NotSent`, the client connect-phase cold-start race, N7): the
+    /// second attempt's CLI finds the started daemon. Never retries
+    /// outcome_unknown, timeouts or post-send failures — the command may
+    /// have run, and re-sending a mutating command could double-execute.
+    /// Close/shutdown paths must not use this: they stay single-shot and
+    /// bounded.
     async fn run_session_command(
         &self,
         argv: &[String],
         deadline: std::time::Instant,
     ) -> Result<Value, HooError> {
         match exec::run_command(argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir).await {
-            Err(e) if exec::not_sent_to_daemon(&e.to_string()) => {
+            Err(HooError::NotSent(_)) => {
                 exec::run_command(argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir).await
             }
             other => other,
@@ -552,9 +553,7 @@ impl Helper {
         deadline: std::time::Instant,
     ) -> Result<String, HooError> {
         match self.run_raw(scoped, exec::spawn_timeout(deadline)?).await {
-            Err(e) if exec::not_sent_to_daemon(&e.to_string()) => {
-                self.run_raw(scoped, exec::spawn_timeout(deadline)?).await
-            }
+            Err(HooError::NotSent(_)) => self.run_raw(scoped, exec::spawn_timeout(deadline)?).await,
             other => other,
         }
     }
@@ -829,6 +828,13 @@ impl Helper {
         } else if stdout.trim().is_empty() {
             Err(HooError::Failed(crate::error::short_stderr(&stderr)))
         } else {
+            // B1: a `--json` caller gets the same connect-phase proof as
+            // `run_command`; anything else surfaces without retry.
+            if let Ok(envelope) = serde_json::from_str::<Value>(stdout.trim()) {
+                if let Some(error) = exec::envelope_connect_failure(&envelope) {
+                    return Err(HooError::NotSent(error));
+                }
+            }
             Err(HooError::Failed(crate::error::short_stderr(&stdout)))
         }
     }

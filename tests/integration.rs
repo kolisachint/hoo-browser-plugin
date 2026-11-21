@@ -798,6 +798,54 @@ async fn fake_post_send_failure_never_retries() {
 }
 
 #[tokio::test]
+async fn fake_page_error_mentioning_connect_is_never_retried() {
+    // B1: the daemon reports a page/JS failure whose text starts with the
+    // client connect prefix (exit 0 envelope, like the real daemon
+    // wrapping a page error). It proves nothing about delivery — the
+    // daemon answered — so the helper surfaces it without retrying:
+    // exactly one eval spawn, and the lease stays usable.
+    let dir = test_tmp("pageerr-noretry");
+    let argv_log = dir.join("argv.log");
+    let fake = fake_wrapper(&dir, &argv_log, None, None);
+    let (_helper, socket) = start_helper(&fake, &dir).await;
+    let peer = connect(&socket, ROOT_TOKEN).await;
+    call(
+        &peer,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    let failed = call(
+        &peer,
+        "browser_eval",
+        serde_json::json!({"js": "FAILCONNECT-PAGE"}),
+    )
+    .await
+    .expect("protocol ok");
+    assert!(is_error(&failed), "page failure must be a tool error");
+    assert!(
+        text_of(&failed).contains("simulated page error"),
+        "the daemon error reaches the model: {}",
+        text_of(&failed)
+    );
+    let calls = argv_lines(&argv_log);
+    assert_eq!(
+        calls.iter().filter(|l| l.contains(" eval ")).count(),
+        1,
+        "a page failure runs exactly once (never retried): {calls:?}"
+    );
+    let snapshot = call(&peer, "browser_snapshot", serde_json::json!({}))
+        .await
+        .expect("snapshot");
+    assert!(
+        !is_error(&snapshot),
+        "lease survives: {}",
+        text_of(&snapshot)
+    );
+}
+
+#[tokio::test]
 async fn fake_closing_a_tab_keeps_the_others() {
     let dir = test_tmp("closekeep");
     let (helper, socket) =

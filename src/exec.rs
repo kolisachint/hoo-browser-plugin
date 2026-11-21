@@ -106,22 +106,49 @@ pub fn ensure_agent_browser_config(sock_dir: &Path) -> std::io::Result<PathBuf> 
     Ok(path)
 }
 
-/// True when an agent-browser failure proves the command never reached
-/// the daemon (connect-phase), so sending it once more cannot run it
-/// twice. Only `Failed to connect` qualifies: the CLI's `connect()` failed
-/// before a single byte was written (cold-start daemon race, N7: the CLI
-/// already respawns the daemon and retries once itself; this covers the
-/// leftover race where that retry also met a starting daemon). Everything
-/// else is excluded, even when it looks transient:
-/// - `outcome_unknown` / `Failed to read` / `Failed to send`: the request
-///   may have been written, so the daemon may have run it — retrying a
+/// Prefix of the client-side connect error (agent-browser
+/// `cli/src/connection.rs` `connect()`: `format!("Failed to connect: {e}")`,
+/// plus the `"Failed to connect: daemon has not written its port"` case).
+/// Only this prefix proves the command never reached the daemon: the CLI's
+/// `connect()` failed before a single byte was written (cold-start daemon
+/// race, N7: the CLI already respawns the daemon and retries once itself;
+/// this covers the leftover race where that retry also met a starting
+/// daemon). Everything else is excluded, even when it looks transient:
+/// - page/model JS errors from `browser_eval` and the daemon's own
+///   `"Failed to connect to CDP at …"`: different shape (exit 0, or no
+///   colon after `connect`), so the prefix never matches them — retrying a
 ///   mutating command (click twice, open twice) could double-execute.
+/// - `outcome_unknown` / `Failed to read` / `Failed to send`: the request
+///   may have been written, so the daemon may have run it.
 /// - timeouts and spawn errors: the CLI was killed mid-flight while the
 ///   daemon may still be running the command.
 ///
 /// Callers retry at most once on true, never on false.
-pub fn not_sent_to_daemon(message: &str) -> bool {
-    message.contains("Failed to connect") && !message.contains("outcome_unknown")
+pub const CONNECT_ERROR_PREFIX: &str = "Failed to connect: ";
+
+/// True when an agent-browser envelope `error` proves the command never
+/// reached the daemon (client-side connect phase, see
+/// [`CONNECT_ERROR_PREFIX`]). The `outcome_unknown` guard stays even
+/// though a connect failure cannot produce one: a daemon-reported error
+/// mentioning it must never retry.
+pub fn is_connect_phase_error(message: &str) -> bool {
+    message.starts_with(CONNECT_ERROR_PREFIX) && !message.contains("outcome_unknown")
+}
+
+/// The connect-phase failure in a `--json` envelope on a non-zero exit:
+/// `Some(error)` only when the envelope reports failure, carries no
+/// `outcome_unknown` code, and its `error` passes
+/// [`is_connect_phase_error`]. Anything else (page errors, daemon errors,
+/// non-JSON output) is `None`: it must surface, never retry.
+pub fn envelope_connect_failure(envelope: &Value) -> Option<String> {
+    if envelope.get("success") == Some(&Value::Bool(true)) {
+        return None;
+    }
+    if envelope.get("code").and_then(Value::as_str) == Some("outcome_unknown") {
+        return None;
+    }
+    let error = envelope.get("error").and_then(Value::as_str)?;
+    is_connect_phase_error(error).then(|| error.to_owned())
 }
 
 /// What a tool call produced: plain JSON or a PNG for MCP image content.
@@ -696,7 +723,20 @@ pub async fn run_command(
         // Failures can land on either stream: usage errors go to stderr,
         // `--json` errors to stdout. Report both so nothing is lost.
         let stderr = short_stderr(&String::from_utf8_lossy(&output.stderr));
-        let stdout = short_stderr(&String::from_utf8_lossy(&output.stdout));
+        let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        // B1: only the client's own connect failure (non-zero exit *and*
+        // a `--json` envelope whose error carries the connect() prefix)
+        // proves the command never ran, so only it returns `NotSent`.
+        // Page/model JS errors and the daemon's own "Failed to connect
+        // to CDP at …" have a different shape and surface as-is: they
+        // must never retry, or a mutating command could run twice. The
+        // envelope parses from the raw stdout, before truncation below.
+        if let Ok(envelope) = serde_json::from_str::<Value>(raw_stdout.trim()) {
+            if let Some(error) = envelope_connect_failure(&envelope) {
+                return Err(HooError::NotSent(error));
+            }
+        }
+        let stdout = short_stderr(&raw_stdout);
         let detail = match (stderr.is_empty(), stdout.is_empty()) {
             (false, false) => format!("stderr: {stderr} | stdout: {stdout}"),
             (false, true) => format!("stderr: {stderr}"),
@@ -792,33 +832,129 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn only_connect_phase_failures_retry() {
-        // Cold-start race the helper may retry once: connect() failed
-        // before a byte was written, so the daemon got nothing.
-        assert!(not_sent_to_daemon(
-            "agent-browser exited 1: stdout: {\"success\":false,\"error\":\"Failed to connect: Connection refused (os error 61)\"}"
+    fn only_envelope_connect_failures_classify_not_sent() {
+        // Cold-start race the helper may retry once: the CLI's connect()
+        // failed before a byte was written, so the daemon got nothing.
+        assert!(is_connect_phase_error(
+            "Failed to connect: Connection refused (os error 61)"
         ));
-        assert!(not_sent_to_daemon(
-            "window new: Failed to connect: No such file (os error 2)"
+        assert!(is_connect_phase_error(
+            "Failed to connect: daemon has not written its port"
+        ));
+        // The daemon's own CDP dial failure has no colon after
+        // `connect`: it must not look like a client connect failure.
+        assert!(!is_connect_phase_error(
+            "Failed to connect to CDP at ws://127.0.0.1:1: refused"
         ));
         // Post-send failures never retry: the command may have run.
-        assert!(!not_sent_to_daemon(
-            "open: {(os error 35)} outcome_unknown (the command reached the daemon but no response came back; it may or may not have run, so it was not retried)"
+        assert!(!is_connect_phase_error(
+            "Failed to read: EAGAIN (outcome_unknown: the command may have run)"
         ));
-        assert!(!not_sent_to_daemon(
-            "open: agent-browser failed: Failed to read: EAGAIN"
-        ));
-        assert!(!not_sent_to_daemon(
-            "click: agent-browser failed: Failed to send: broken pipe"
-        ));
-        // Timeouts and spawn errors never retry: the daemon may still run it.
-        assert!(!not_sent_to_daemon(
-            "open: agent-browser timed out after 30s"
-        ));
-        assert!(!not_sent_to_daemon(
-            "open: cannot spawn agent-browser: missing binary"
-        ));
-        assert!(!not_sent_to_daemon("window new failed (injected)"));
+        assert!(!is_connect_phase_error("Failed to read: EAGAIN"));
+        assert!(!is_connect_phase_error("Failed to send: broken pipe"));
+        assert!(!is_connect_phase_error("window new failed (injected)"));
+    }
+
+    #[test]
+    fn envelope_classifier_needs_failure_shape() {
+        let connect =
+            json!({"success": false, "error": "Failed to connect: refused (os error 61)"});
+        assert_eq!(
+            envelope_connect_failure(&connect).as_deref(),
+            Some("Failed to connect: refused (os error 61)")
+        );
+        // A success envelope never classifies, even with odd content.
+        assert_eq!(
+            envelope_connect_failure(&json!({"success": true, "data": {}})),
+            None
+        );
+        // outcome_unknown code never classifies, whatever the text says.
+        assert_eq!(
+            envelope_connect_failure(&json!({
+                "success": false,
+                "error": "Failed to connect: refused",
+                "code": "outcome_unknown",
+            })),
+            None
+        );
+        // Daemon errors (exit 0 path) never classify, even when the text
+        // mentions connecting: they arrived *from* the daemon.
+        assert_eq!(
+            envelope_connect_failure(&json!({
+                "success": false,
+                "error": "Failed to connect to CDP at ws://x: refused",
+            })),
+            None
+        );
+        assert_eq!(envelope_connect_failure(&json!({"weird": true})), None);
+    }
+
+    /// A stand-in `agent-browser`: prints `body` on stdout, exits `code`.
+    fn fake_cli(dir: &std::path::Path, name: &str, code: i32, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{body}'\nexit {code}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn run_command_returns_not_sent_only_for_client_connect() {
+        let dir = std::env::temp_dir().join(format!("hoo-b1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let timeout = std::time::Duration::from_secs(10);
+        // Client connect failure (non-zero + envelope prefix): NotSent.
+        let cli = fake_cli(
+            &dir,
+            "connect-fail.sh",
+            1,
+            r#"{"success":false,"data":null,"error":"Failed to connect: refused (os error 61)"}"#,
+        );
+        let error = run_command(&[cli.to_string_lossy().into_owned()], timeout, &dir)
+            .await
+            .expect_err("connect failure must error");
+        assert!(
+            matches!(error, HooError::NotSent(_)),
+            "connect failure must be NotSent, got {error:?}"
+        );
+        // Daemon CDP failure (non-zero, no colon prefix): plain Failed.
+        let cli = fake_cli(
+            &dir,
+            "cdp-fail.sh",
+            1,
+            r#"{"success":false,"data":null,"error":"Failed to connect to CDP at ws://x: refused"}"#,
+        );
+        let error = run_command(&[cli.to_string_lossy().into_owned()], timeout, &dir)
+            .await
+            .expect_err("cdp failure must error");
+        assert!(
+            matches!(error, HooError::Failed(_)),
+            "cdp failure must be Failed, got {error:?}"
+        );
+        // Page/model JS error reported by the daemon (exit 0): Failed,
+        // never NotSent, even though the text starts with the prefix.
+        let cli = fake_cli(
+            &dir,
+            "page-fail.sh",
+            0,
+            r#"{"success":false,"data":null,"error":"Failed to connect: simulated page error"}"#,
+        );
+        let error = run_command(&[cli.to_string_lossy().into_owned()], timeout, &dir)
+            .await
+            .expect_err("page failure must error");
+        assert!(
+            matches!(error, HooError::Failed(_)),
+            "page failure must be Failed, got {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn argv(tool: &str, args: Value) -> Vec<String> {
