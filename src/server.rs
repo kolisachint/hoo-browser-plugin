@@ -1078,3 +1078,42 @@ pub async fn sweep_loop(helper: Helper) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_helper(dir: &std::path::Path) -> Helper {
+        Helper::new(
+            PathBuf::from("/bin/true"),
+            "ws://fake".into(),
+            dir.to_owned(),
+            crate::backend::socket_dir(dir),
+            "root-token".into(),
+            "root".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn shutdown_fast_kills_and_reaps_a_plain_child() {
+        let dir = std::env::temp_dir().join(format!("hoo-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = test_helper(&dir);
+        // A plain `sleep` shares our process group, so kill_tree must take
+        // the single-kill path (never killpg on our own group).
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let pid = child.id().expect("child pid") as libc::pid_t;
+        helper.set_chromium(child, None).await;
+        // Must return promptly even though the child would sleep 30 s.
+        tokio::time::timeout(std::time::Duration::from_secs(10), helper.shutdown_fast())
+            .await
+            .expect("shutdown_fast is bounded");
+        // Reaped: signalling the pid fails.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
