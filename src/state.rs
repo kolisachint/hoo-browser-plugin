@@ -43,8 +43,11 @@ pub struct State {
     pub tokens: HashMap<String, AgentRecord>,
     /// session -> lease.
     pub leases: HashMap<String, Lease>,
-    /// agent -> sessions in tab-index order (tab N is `order[N-1]`).
-    pub order: HashMap<String, Vec<String>>,
+    /// Fixed tab slots per agent: `order[agent][tab - 1]` is the session
+    /// name, or `None` for a closed tab. Closing clears the slot without
+    /// renumbering the others (M6); reopening the number takes a fresh
+    /// session in the same slot.
+    pub order: HashMap<String, Vec<Option<String>>>,
 }
 
 /// Agent ids may contain `/` (`root/task-1`); session names may not, so map
@@ -173,10 +176,10 @@ impl State {
     pub fn remove_agent(&mut self, agent_id: &str) -> Vec<String> {
         self.tokens.retain(|_, record| record.agent_id != agent_id);
         let sessions = self.order.remove(agent_id).unwrap_or_default();
-        for session in &sessions {
+        for session in sessions.iter().flatten() {
             self.leases.remove(session);
         }
-        sessions
+        sessions.into_iter().flatten().collect()
     }
 
     /// Root takes every lease of `from` (ownership moves, names stay).
@@ -185,10 +188,10 @@ impl State {
             return Err(HooError::Failed("cannot adopt your own sessions".into()));
         }
         let mut sessions = self.order.remove(from).unwrap_or_default();
-        if sessions.is_empty() {
+        if sessions.iter().flatten().next().is_none() {
             return Err(HooError::Failed(format!("agent {from} has no sessions")));
         }
-        for session in &sessions {
+        for session in sessions.iter().flatten() {
             if let Some(lease) = self.leases.get_mut(session) {
                 lease.owner = by_root.to_owned();
             }
@@ -208,11 +211,14 @@ impl State {
         self.order
             .get(agent_id)
             .and_then(|sessions| sessions.get(tab - 1))
-            .cloned()
+            .and_then(|slot| slot.clone())
             .ok_or_else(|| {
                 HooError::Failed(format!(
                     "agent {agent_id} has no tab {tab} (it has {})",
-                    self.order.get(agent_id).map(Vec::len).unwrap_or(0),
+                    self.order
+                        .get(agent_id)
+                        .map(|slots| slots.iter().filter(|s| s.is_some()).count())
+                        .unwrap_or(0),
                 ))
             })
     }
@@ -224,17 +230,25 @@ impl State {
         if tab == 0 {
             return Err(HooError::Failed("tab numbers start at 1".into()));
         }
-        let owned = self.order.get(agent_id).map(Vec::len).unwrap_or(0);
-        if tab <= owned {
-            return Ok((self.order[agent_id][tab - 1].clone(), false));
-        }
-        if tab > owned + 1 {
+        let slots = self.order.get(agent_id).map(Vec::len).unwrap_or(0);
+        if tab <= slots {
+            if let Some(session) = self.order[agent_id][tab - 1].clone() {
+                return Ok((session, false));
+            }
+            // A closed slot: fall through and reopen it with a fresh
+            // session (the limits below still apply).
+        } else if tab > slots + 1 {
             return Err(HooError::Failed(format!(
-                "agent {agent_id} has {owned} tab(s); open tab {} first",
-                owned + 1
+                "agent {agent_id} has {slots} tab(s); open tab {} first",
+                slots + 1
             )));
         }
-        if owned >= MAX_TABS_PER_AGENT {
+        let open = self
+            .order
+            .get(agent_id)
+            .map(|slots| slots.iter().filter(|s| s.is_some()).count())
+            .unwrap_or(0);
+        if open >= MAX_TABS_PER_AGENT {
             return Err(HooError::Failed(format!(
                 "agent {agent_id} already has {MAX_TABS_PER_AGENT} tabs (limit)"
             )));
@@ -262,10 +276,12 @@ impl State {
                 last_used: Instant::now(),
             },
         );
-        self.order
-            .entry(agent_id.to_owned())
-            .or_default()
-            .push(session.clone());
+        let slots = self.order.entry(agent_id.to_owned()).or_default();
+        if tab <= slots.len() {
+            slots[tab - 1] = Some(session.clone());
+        } else {
+            slots.push(Some(session.clone()));
+        }
         Ok((session, true))
     }
 
@@ -288,8 +304,14 @@ impl State {
             )));
         }
         self.leases.remove(session);
+        // Clear the slot so the other tabs keep their numbers (M6).
         for sessions in self.order.values_mut() {
-            sessions.retain(|s| s != session);
+            if let Some(slot) = sessions
+                .iter_mut()
+                .find(|s| **s == Some(session.to_owned()))
+            {
+                *slot = None;
+            }
         }
         Ok(())
     }
@@ -303,9 +325,17 @@ impl State {
             .collect()
     }
 
-    /// Sessions owned by `agent_id` (tab order), for `browser_tabs list`.
+    /// Live sessions owned by `agent_id` (tab order), for `browser_tabs
+    /// list` and `browser_cli` scoping. Closed slots contribute nothing.
     pub fn owned(&self, agent_id: &str) -> Vec<String> {
-        self.order.get(agent_id).cloned().unwrap_or_default()
+        self.order
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter(|s| self.leases.contains_key(s))
+            .collect()
     }
 }
 
@@ -551,6 +581,25 @@ mod tests {
         // Ended agents no longer own anything to close.
         assert!(state.remove_agent("root/task-1").is_empty());
         assert_eq!(state.leases.len(), 2);
+    }
+
+    #[test]
+    fn closing_a_tab_does_not_renumber_the_others() {
+        let mut state = root_state();
+        let (s1, _) = state.ensure("root/task-1", 1).unwrap();
+        let (s2, _) = state.ensure("root/task-1", 2).unwrap();
+        state.close("root/task-1", &s1).unwrap();
+        // Tab 2 keeps its session; tab 1 resolves to nothing now.
+        assert_eq!(state.resolve("root/task-1", 2).unwrap(), s2);
+        assert!(state.resolve("root/task-1", 1).is_err());
+        // Reopening tab 1 takes a fresh session in the same slot.
+        let (s1_new, fresh) = state.ensure("root/task-1", 1).unwrap();
+        assert!(fresh && s1_new == s1);
+        assert_eq!(state.resolve("root/task-1", 2).unwrap(), s2);
+        // The per-agent limit counts live tabs only: 2 live + reopen = 3.
+        state.ensure("root/task-1", 3).unwrap();
+        state.ensure("root/task-1", 4).unwrap();
+        assert!(state.ensure("root/task-1", 5).is_err());
     }
 
     #[test]
