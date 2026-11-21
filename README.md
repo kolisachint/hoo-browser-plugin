@@ -54,9 +54,10 @@ HOOCODE_HELPER_SOCKET=/tmp/h.sock HOOCODE_HELPER_TOKEN=<root> \
 HOO_BROWSER_DATA=~/.agents/plugin-data/hoo-browser \
   hoo-browser --parent-pid <hoocode-pid>
 
-# CLI fallback from inside an agent Shell (env set by hoocode per helper)
-hoo-browser cli snapshot
-hoo-browser --session root_task-1-1 eval "document.title"
+# CLI fallback from inside an agent Shell (env set by hoocode per helper;
+# needs the helper to have started: make one browser tool call first)
+"$HOOCODE_HELPER_BIN_HOO_BROWSER" cli snapshot
+"$HOOCODE_HELPER_BIN_HOO_BROWSER" cli --session root_task-1-1 eval "document.title"
 ```
 
 Per-call overhead lines go to `<data dir>/hoo-browser.log` (debug level;

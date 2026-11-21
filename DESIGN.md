@@ -27,7 +27,9 @@ helper's `--cdp`.
 Exactly the 8 declared tools (`browser_open`, `browser_snapshot`,
 `browser_act`, `browser_screenshot`, `browser_tabs`, `browser_wait`,
 `browser_nav`, `browser_eval`) plus the hidden `browser_cli` (callable,
-never listed): the CLI fallback for the long tail. Permission hints live in
+never listed): the CLI fallback for the long tail. From Shell it runs as
+`"$HOOCODE_HELPER_BIN_HOO_BROWSER" cli <args>` — hoocode sets that env var
+once the helper has started on the first browser tool call. Permission hints live in
 `plugin.json`: open/snapshot/screenshot/tabs(list)/wait read; act/nav/tabs
 act; eval dangerous. Screenshots return MCP image content (the CLI writes a
 file; the helper reads it back and base64s it).

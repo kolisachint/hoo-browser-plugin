@@ -44,10 +44,13 @@ in `value` (`Enter`, `Escape`) and falls back to `ref`.
 ## CLI fallback (the long tail)
 
 Cookies, network, recording and everything else the eight tools do not cover:
-run `hoo-browser` through Shell. It calls the helper scoped to **your**
-sessions — a `--session` naming another agent's session is refused.
+run the helper binary through Shell. hoocode puts its absolute path in
+`HOOCODE_HELPER_BIN_HOO_BROWSER` (the binary is not on Shell's `PATH`). It
+calls the helper scoped to **your** sessions — a `--session` naming another
+agent's session is refused. The helper starts on the first browser tool call,
+so run one tool before the fallback.
 
 ```bash
-hoo-browser snapshot                # your default tab
-hoo-browser --session <yours> eval "document.title"
+"$HOOCODE_HELPER_BIN_HOO_BROWSER" cli snapshot                # your default tab
+"$HOOCODE_HELPER_BIN_HOO_BROWSER" cli --session <yours> eval "document.title"
 ```
