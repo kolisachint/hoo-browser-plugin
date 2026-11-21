@@ -952,31 +952,41 @@ async fn fake_devtools() -> (
 async fn fake_version_probe_detects_fork_and_upstream() {
     // B3: the mode comes from `agent-browser --version`: `-hoo.` in the
     // output means the fork (scoped), anything else means safe.
+    // The override travels per call, never via process env: parallel
+    // tests share the process, so `set_var` here would leak into other
+    // tests' helpers (notably the real suite's `probe_ab_scoped`).
     use hoo_browser::backend;
+    fn version_fake(dir: &Path, name: &str, version: &str) -> PathBuf {
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/bash\nexport FAKE_VERSION={version}\nexec '{}' \"$@\"\n",
+            manifest_dir()
+                .join("tests/fake-agent-browser.sh")
+                .to_string_lossy()
+                .replace('\'', "'\\''")
+        );
+        std::fs::write(&path, script).expect("write version fake");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        path
+    }
     let dir = test_tmp("version-probe");
-    let fake = dir.join("fake-agent-browser.sh");
-    std::fs::copy(manifest_dir().join("tests/fake-agent-browser.sh"), &fake).expect("copy fake");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-    // SAFETY: FAKE_VERSION only affects the fake's `--version` output,
-    // which no other test invokes.
-    unsafe {
-        std::env::remove_var("HOO_BROWSER_AB_SCOPED");
-        std::env::set_var("FAKE_VERSION", "0.43.1-hoo.1");
-    }
-    let fork = backend::probe_ab_scoped(&fake).await;
-    unsafe {
-        std::env::set_var("FAKE_VERSION", "0.43.0");
-    }
-    let upstream = backend::probe_ab_scoped(&fake).await;
-    unsafe {
-        std::env::remove_var("FAKE_VERSION");
-    }
+    let fork_fake = version_fake(&dir, "fork-fake.sh", "0.43.1-hoo.1");
+    let upstream_fake = version_fake(&dir, "upstream-fake.sh", "0.43.0");
+    let fork = backend::probe_ab_scoped_with(&fork_fake, None).await;
+    let upstream = backend::probe_ab_scoped_with(&upstream_fake, None).await;
+    // A forced value short-circuits without spawning: even a missing
+    // binary answers.
+    let missing = dir.join("no-such-binary");
+    let forced_on = backend::probe_ab_scoped_with(&missing, Some(true)).await;
+    let forced_off = backend::probe_ab_scoped_with(&missing, Some(false)).await;
     assert!(fork, "a -hoo.N version must mean scoped mode");
     assert!(!upstream, "an upstream version must mean safe mode");
+    assert!(forced_on, "a forced true must mean scoped mode");
+    assert!(!forced_off, "a forced false must mean safe mode");
     assert!(
         backend::version_is_scoped("agent-browser 0.43.1-hoo.1"),
         "fork versions carry -hoo."
@@ -1174,7 +1184,7 @@ async fn fake_close_lists_targets_before_closing_the_session() {
 }
 
 #[tokio::test]
-async fn fake_spawn_and_timeout_failures_are_tool_errors() {
+async fn fake_spawn_failure_is_tool_error() {
     // No such binary: the spawn fails and the model sees a tool error.
     let dir = test_tmp("spawnfail");
     let socket = dir.join("helper.sock");
@@ -1202,31 +1212,88 @@ async fn fake_spawn_and_timeout_failures_are_tool_errors() {
         "got: {}",
         text_of(&failed)
     );
+}
 
-    // A hanging agent-browser trips the per-call timeout (lowered for the
-    // test; concurrent fake calls take milliseconds, far under either).
+#[tokio::test]
+async fn fake_call_timeout_is_tool_error() {
+    // A hanging agent-browser trips the per-call timeout, lowered for the
+    // test (a 45 s timeout test would be absurd). The override travels on
+    // the spawned helper's own env: setting it process-wide (`set_var`)
+    // would leak into parallel tests' in-process helpers and fail their
+    // calls after 1 s. Sessions containing "slow" sleep 30 s in the
+    // fake, so `window new` for the slow agent always trips it.
     let dir = test_tmp("timeout");
-    let argv_log = dir.join("argv.log");
-    let fake = fake_wrapper(&dir, &argv_log, None, None);
-    let (helper, socket) = start_helper(&fake, &dir).await;
+    let socket = dir.join("helper.sock");
+    let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_hoo-browser"));
+    let mut child = tokio::process::Command::new(&helper_bin)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .env("HOOCODE_HELPER_SOCKET", &socket)
+        .env("HOOCODE_HELPER_TOKEN", ROOT_TOKEN)
+        .env("HOOCODE_AGENT_ID", "root")
+        .env("HOO_BROWSER_DATA", &dir)
+        .env(
+            "HOO_BROWSER_AGENT_BROWSER",
+            manifest_dir().join("tests/fake-agent-browser.sh"),
+        )
+        .env("HOO_BROWSER_CHROME", fake_chrome(&dir))
+        .env("HOO_BROWSER_CALL_TIMEOUT_SECS", "1")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn helper");
+    wait_for_socket(&socket).await;
     let root = connect(&socket, ROOT_TOKEN).await;
-    notify_started_child(&helper, &root, "root/slowpoke", "slow-token").await;
-    let slow = connect(&socket, "slow-token").await;
-    std::env::set_var("HOO_BROWSER_CALL_TIMEOUT_SECS", "1");
-    let timed = call(
-        &slow,
-        "browser_open",
-        serde_json::json!({"url": "https://x.example/"}),
-    )
+    root.send_notification(rmcp::model::ClientNotification::CustomNotification(
+        CustomNotification::new(
+            "hoocode/agentStarted".to_owned(),
+            Some(serde_json::json!({
+                "agentId": "root/slowpoke",
+                "parentId": "root",
+                "depth": 1,
+                "token": "slow-token",
+            })),
+        ),
+    ))
     .await
-    .expect("protocol ok");
-    std::env::remove_var("HOO_BROWSER_CALL_TIMEOUT_SECS");
+    .expect("agentStarted");
+    let slow = connect(&socket, "slow-token").await;
+    // Registration races the first call: an unknown token is a fast
+    // protocol refusal, so retry until the helper knows us.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let timed = loop {
+        let result = call(
+            &slow,
+            "browser_open",
+            serde_json::json!({"url": "https://x.example/"}),
+        )
+        .await;
+        match result {
+            Err(e) if e.contains("unknown token") => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "slow agent never registered"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("protocol error: {e}"),
+            Ok(timed) => break timed,
+        }
+    };
     assert!(is_error(&timed), "timeout must be a tool error");
     assert!(
         text_of(&timed).contains("timed out"),
         "got: {}",
         text_of(&timed)
     );
+    // SAFETY: SIGKILL to our own test child.
+    unsafe {
+        libc::kill(
+            child.id().expect("helper pid") as libc::pid_t,
+            libc::SIGKILL,
+        );
+    }
+    let _ = child.wait().await;
 }
 
 /// Send `agentEnded` without waiting (ignored ones change nothing).
@@ -1533,7 +1600,10 @@ fn ref_for(result_text: &str, label: &str) -> Option<String> {
 }
 
 /// Page targets on the shared browser via the DevTools HTTP endpoint.
-async fn cdp_page_targets(endpoint: &str) -> usize {
+/// Every DevTools page target as `(target id, url)`. The urls let the
+/// real suite count one agent's pages exactly (child-3's `agent=2` query)
+/// instead of hard-coding global counts that differ per close mode.
+async fn cdp_targets(endpoint: &str) -> Vec<(String, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let bare = endpoint
         .trim_start_matches("ws://")
@@ -1595,9 +1665,19 @@ async fn cdp_page_targets(endpoint: &str) -> usize {
             targets
                 .iter()
                 .filter(|t| t.get("type") == Some(&Value::String("page".into())))
-                .count()
+                .filter_map(|t| {
+                    Some((
+                        t.get("id").and_then(Value::as_str)?.to_owned(),
+                        t.get("url").and_then(Value::as_str)?.to_owned(),
+                    ))
+                })
+                .collect()
         })
-        .unwrap_or(0)
+        .unwrap_or_default()
+}
+
+async fn cdp_page_targets(endpoint: &str) -> usize {
+    cdp_targets(endpoint).await.len()
 }
 
 #[tokio::test]
@@ -1613,9 +1693,10 @@ async fn real_no_steal_suite() {
         .expect("launch chromium");
     let sock_dir = hoo_browser::backend::socket_dir(&dir);
     hoo_browser::exec::ensure_agent_browser_config(&sock_dir).expect("helper config");
+    let endpoint = chromium.endpoint.clone();
     let helper = Helper::new(
         agent_browser.clone(),
-        chromium.endpoint.clone(),
+        endpoint.clone(),
         dir.clone(),
         sock_dir,
         ROOT_TOKEN.into(),
@@ -1623,14 +1704,19 @@ async fn real_no_steal_suite() {
     );
     // B3: the real suite runs in scoped mode only when forced
     // (HOO_BROWSER_AB_SCOPED=1); otherwise the upstream binary probes safe.
-    helper.set_scoped(hoo_browser::backend::probe_ab_scoped(&agent_browser).await);
+    // Remember which: the close-count assertions below differ per mode.
+    let scoped = hoo_browser::backend::probe_ab_scoped(&agent_browser).await;
+    helper.set_scoped(scoped);
+    // Hand the browser to the helper, as production startup does, so the
+    // teardown below kills the whole process group (killpg), not just the
+    // main child that `kill_on_drop` would take.
+    helper
+        .set_chromium(chromium.child, chromium.profile_lock)
+        .await;
     let socket = dir.join("helper.sock");
     let _ = std::fs::remove_file(&socket);
     tokio::spawn(hoo_browser::server::serve(helper.clone(), socket.clone()));
     wait_for_socket(&socket).await;
-    let endpoint = chromium.endpoint.clone();
-    // Chromium dies with the test process (kill_on_drop in the handle).
-    let _chromium = chromium;
 
     let (page, _page_server) = start_test_page().await;
     let root = connect(&socket, ROOT_TOKEN).await;
@@ -1813,7 +1899,9 @@ async fn real_no_steal_suite() {
     }
 
     // H4: `browser_tabs close` closes the lease's windows too: the
-    // DevTools /json endpoint loses at least one page target.
+    // DevTools /json endpoint loses at least one page target. A close
+    // fans out to a `tab list` (capped at 15 s) plus one DevTools close
+    // per target, so poll past that worst case instead of racing it.
     let pages_full = cdp_page_targets(&endpoint).await;
     let closed_tab = call(
         &children[0],
@@ -1828,7 +1916,7 @@ async fn real_no_steal_suite() {
         text_of(&closed_tab)
     );
     let mut pages_closed = pages_full;
-    for _ in 0..50 {
+    for _ in 0..150 {
         pages_closed = cdp_page_targets(&endpoint).await;
         if pages_closed < pages_full {
             break;
@@ -1849,28 +1937,141 @@ async fn real_no_steal_suite() {
     .await;
     assert!(cross.is_err(), "cross-agent CLI must be refused: {cross:?}");
 
-    // agentEnded closes that agent's sessions and windows: the DevTools
-    // /json endpoint must lose at least its two page targets.
-    let pages_before = cdp_page_targets(&endpoint).await;
+    // agentEnded closes that agent's sessions and windows. The expected
+    // counts are measured, not hard-coded, and the same assertions hold
+    // in both modes:
+    // - safe: each lease closes only its bound target (recorded at window
+    //   open), so exactly child-3's own pages go.
+    // - scoped: each lease closes every target in its `tab list` (the
+    //   fork scopes it to owned tabs: its pages plus its background
+    //   tabs), so the total drops by at least its pages.
+    // Either way child-3's `agent=2` pages must all be gone, the total
+    // must drop by at least that many, and the survivors' pages stay.
+    // Like the close above, poll past the worst case: two leases close
+    // sequentially, each with a 15 s `tab list` cap.
+    let targets_before = cdp_targets(&endpoint).await;
+    let pages_before = targets_before.len();
     assert!(pages_before >= 7, "leases must own pages: {pages_before}");
+    let owned_before: Vec<&(String, String)> = targets_before
+        .iter()
+        .filter(|(_, url)| url.contains("agent=2&"))
+        .collect();
+    assert_eq!(
+        owned_before.len(),
+        2,
+        "child-3 must own exactly its two tab pages, got: {targets_before:?}"
+    );
+    println!(
+        "real suite: scoped={scoped} pages_before={pages_before} (child-3 owns {})",
+        owned_before.len()
+    );
     notify_ended(&helper, &root, "root/task-3", "child-3-token").await;
     let ended = call(&children[2], "browser_snapshot", serde_json::json!({})).await;
     assert!(ended.is_err(), "ended agent must be unknown: {ended:?}");
-    let mut pages_after = pages_before;
-    for _ in 0..50 {
-        pages_after = cdp_page_targets(&endpoint).await;
-        if pages_after + 2 <= pages_before {
-            break;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let targets_after = loop {
+        let targets = cdp_targets(&endpoint).await;
+        let owned_left = targets
+            .iter()
+            .filter(|(_, url)| url.contains("agent=2&"))
+            .count();
+        if owned_left == 0 && targets.len() + owned_before.len() <= pages_before {
+            break targets;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agentEnded must close windows too: {} child-3 pages left, {} vs {pages_before} page targets (scoped={scoped})",
+            owned_left,
+            targets.len(),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
+    let pages_after = targets_after.len();
     assert!(
-        pages_after + 2 <= pages_before,
-        "agentEnded must close windows too: {pages_after} vs {pages_before} page targets"
+        pages_after + owned_before.len() <= pages_before,
+        "agentEnded must close windows too: {pages_after} vs {pages_before} page targets (scoped={scoped})"
     );
+    // The survivors keep their pages: no-steal means the ended agent's
+    // closes never touch other leases' windows, in either mode.
+    for (agent, want) in [("agent=0&", 1), ("agent=1&", 2)] {
+        let kept = targets_after
+            .iter()
+            .filter(|(_, url)| url.contains(agent))
+            .count();
+        assert_eq!(
+            kept, want,
+            "surviving {agent} pages must remain, got: {targets_after:?}"
+        );
+    }
 
     report_overheads(&dir);
-    // Chromium is killed by `_chromium` drop at test end.
+
+    // Teardown (H3): close every lease, kill the browser tree, then stop
+    // the agent-browser daemons. A bare `close` only disconnects: daemons
+    // would idle out 10 min later, stranding a process per run.
+    helper.close_all_sessions().await;
+    helper.shutdown().await;
+    helper.stop_daemons().await;
+    assert_no_leftover_processes(&dir, &agent_browser).await;
+}
+
+/// True while the pid exists (signal 0 checks: it sends nothing).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// No stray processes from this run may remain: every agent-browser
+/// daemon pid file in the run's socket dir must be dead, no process may
+/// still run the run's agent-browser binary, and no Chromium may still
+/// carry the run's profile dir.
+async fn assert_no_leftover_processes(dir: &Path, agent_browser: &Path) {
+    let sock_dir = hoo_browser::backend::socket_dir(dir);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut live = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&sock_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Ok(pid) = text.trim().parse::<u32>() {
+                        if pid > 0 && pid_alive(pid) {
+                            live.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+        if live.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent-browser daemons still alive after teardown: {live:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let running = |pattern: &str| {
+        std::process::Command::new("pgrep")
+            .args(["-f", pattern])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .unwrap_or_default()
+    };
+    let daemons = running(&agent_browser.to_string_lossy());
+    assert!(
+        daemons.is_empty(),
+        "agent-browser processes remain after teardown: {daemons}"
+    );
+    let chromes = running(&dir.to_string_lossy());
+    assert!(
+        chromes.is_empty(),
+        "chromium processes remain after teardown: {chromes}"
+    );
 }
 
 fn report_overheads(dir: &Path) {

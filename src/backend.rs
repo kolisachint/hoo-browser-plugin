@@ -93,7 +93,15 @@ pub fn ab_scoped_from_env() -> Option<bool> {
 /// agent-browser binary's `--version`. Anything unparsable (missing
 /// binary, timeout, odd output) means safe mode.
 pub async fn probe_ab_scoped(agent_browser: &Path) -> bool {
-    if let Some(forced) = ab_scoped_from_env() {
+    probe_ab_scoped_with(agent_browser, ab_scoped_from_env()).await
+}
+
+/// `probe_ab_scoped` with the override passed explicitly, so tests can
+/// exercise both branches without touching process-global env (parallel
+/// tests share it: `set_var` here would leak into other tests' helpers).
+/// `None` probes the binary; `Some` short-circuits without spawning.
+pub async fn probe_ab_scoped_with(agent_browser: &Path, forced: Option<bool>) -> bool {
+    if let Some(forced) = forced {
         return forced;
     }
     let probe = tokio::process::Command::new(agent_browser)

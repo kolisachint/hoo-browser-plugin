@@ -1286,6 +1286,21 @@ impl Helper {
             .await;
     }
 
+    /// Kill leftover agent-browser daemons owned by this helper: every
+    /// `<sock_dir>/<session>.pid` whose pid is still an agent-browser
+    /// process gets SIGTERM, then SIGKILL. Closing sessions alone only
+    /// disconnects them — the daemons would otherwise idle out after
+    /// `AGENT_BROWSER_IDLE_TIMEOUT_MS` (10 min), stranding a process per
+    /// test run. Best effort: dead pids and foreign processes are left
+    /// alone (the comm check guards against pid reuse).
+    pub async fn stop_daemons(&self) {
+        let agent_browser = self.inner.agent_browser.clone();
+        let sock_dir = self.inner.sock_dir.clone();
+        tokio::task::spawn_blocking(move || stop_daemons_blocking(&agent_browser, &sock_dir))
+            .await
+            .ok();
+    }
+
     async fn close_all_capped(&self, cap: std::time::Duration) {
         let sessions: Vec<String> = self
             .inner
@@ -1330,6 +1345,77 @@ fn kill_tree(child: &tokio::process::Child) {
     // SAFETY: SIGKILL to our own child only.
     unsafe {
         let _ = libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// True while the pid exists (signal 0 checks: it sends nothing).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks, it sends nothing.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// The process command for a pid (`ps -o args=`), empty when gone.
+#[cfg(unix)]
+fn pid_command(pid: u32) -> String {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Blocking half of `Helper::stop_daemons`: SIGTERM every live
+/// agent-browser daemon listed in the socket dir, then SIGKILL the
+/// stragglers. A pid is only signalled when its command still names the
+/// agent-browser binary, so a recycled pid is never touched.
+#[cfg(unix)]
+fn stop_daemons_blocking(agent_browser: &std::path::Path, sock_dir: &std::path::Path) {
+    let binary = agent_browser.to_string_lossy();
+    let short = agent_browser
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut pids: Vec<u32> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(sock_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            if pid > 0 && pid_alive(pid) {
+                let command = pid_command(pid);
+                if !command.is_empty()
+                    && (command.contains(binary.as_ref()) || command.contains(&short))
+                {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    for pid in &pids {
+        // SAFETY: SIGTERM only to a live pid just verified as ours.
+        unsafe {
+            let _ = libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for pid in &pids {
+        while pid_alive(*pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // SAFETY: SIGKILL only to a live pid just verified as ours.
+        if pid_alive(*pid) {
+            unsafe {
+                let _ = libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
     }
 }
 
