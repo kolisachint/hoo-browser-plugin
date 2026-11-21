@@ -599,15 +599,18 @@ pub struct CallRecord<'a> {
 }
 
 /// One JSON line per call for the overhead report (spec B2: debug level, log
-/// file in the data dir, never tokens or argument values).
+/// file in the data dir, never tokens or argument values). Times are
+/// microseconds from request entry: `child_us` is the agent-browser
+/// spawn-to-exit (including its daemon connect), `overhead_us` is everything
+/// else the helper adds (M5).
 pub async fn log_call(log_path: &Path, record: CallRecord<'_>) {
     let line = serde_json::json!({
         "tool": record.tool,
         "agent": record.agent,
         "session": record.session,
-        "total_ms": record.total.as_millis(),
-        "child_ms": record.child.as_millis(),
-        "overhead_ms": record.total.saturating_sub(record.child).as_millis(),
+        "total_us": record.total.as_micros(),
+        "child_us": record.child.as_micros(),
+        "overhead_us": record.total.saturating_sub(record.child).as_micros(),
         "ok": record.ok,
         "error": record.error.map(|e| e.chars().take(300).collect::<String>()),
     });

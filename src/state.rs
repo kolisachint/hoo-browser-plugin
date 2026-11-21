@@ -38,6 +38,9 @@ pub struct Lease {
     /// own window (H2): concurrent first calls on a new tab wait on this
     /// instead of opening duplicate windows.
     pub initializing: bool,
+    /// Set while the sweeper closes the lease: calls finding this error out
+    /// instead of running on a session that is going away (M7).
+    pub closing: bool,
 }
 
 /// Tokens plus leases. Guarded by one mutex in the app state.
@@ -279,6 +282,7 @@ impl State {
                 owner: agent_id.to_owned(),
                 last_used: Instant::now(),
                 initializing: true,
+                closing: false,
             },
         );
         let slots = self.order.entry(agent_id.to_owned()).or_default();
@@ -308,16 +312,8 @@ impl State {
                 "session {session} belongs to {owner}"
             )));
         }
-        self.leases.remove(session);
         // Clear the slot so the other tabs keep their numbers (M6).
-        for sessions in self.order.values_mut() {
-            if let Some(slot) = sessions
-                .iter_mut()
-                .find(|s| **s == Some(session.to_owned()))
-            {
-                *slot = None;
-            }
-        }
+        self.remove_session(session);
         Ok(())
     }
 
@@ -353,11 +349,64 @@ impl State {
         }
     }
 
-    /// Sessions idle longer than the limit, for the sweeper.
+    /// Claim one idle lease for closing (M7): succeeds only if the lease
+    /// is still untouched since `as_of` (the sweep's check time) and not
+    /// already claimed. Anything touched after the check — a call that
+    /// started before it (touch at call start) or during the close — fails
+    /// the re-check and keeps its lease.
+    pub fn try_claim_close(&mut self, session: &str, as_of: Instant) -> bool {
+        let idle = self.leases.get(session).is_some_and(|lease| {
+            !lease.closing
+                && !lease.initializing
+                && as_of.duration_since(lease.last_used).as_secs() > IDLE_SECONDS
+        });
+        if idle {
+            if let Some(lease) = self.leases.get_mut(session) {
+                lease.closing = true;
+            }
+        }
+        idle
+    }
+
+    /// Still untouched since the sweep's check time? A call that started
+    /// during the browser-side close touched the lease, so removal is
+    /// skipped and the claim released instead.
+    pub fn still_idle(&self, session: &str, as_of: Instant) -> bool {
+        self.leases
+            .get(session)
+            .is_some_and(|lease| lease.closing && lease.last_used <= as_of)
+    }
+
+    /// True while the sweeper owns the lease's close claim.
+    pub fn is_closing(&self, session: &str) -> bool {
+        self.leases.get(session).is_some_and(|lease| lease.closing)
+    }
+
+    /// Release a close claim without removing the lease.
+    pub fn unclaim(&mut self, session: &str) {
+        if let Some(lease) = self.leases.get_mut(session) {
+            lease.closing = false;
+        }
+    }
+
+    /// Remove a lease regardless of owner (sweeper path; the claim is the
+    /// authorization).
+    pub fn remove_session(&mut self, session: &str) {
+        self.leases.remove(session);
+        self.clear_slot(session);
+    }
+
+    /// Sessions idle longer than the limit, for the sweeper. Claimed leases
+    /// are skipped; `try_claim_close` re-checks before removal. Calls in
+    /// flight are skipped by recency: every call touches its lease at start
+    /// (well under the 10-minute limit, since calls time out at 45 s), so
+    /// an in-flight lease is never idle here.
     pub fn idle(&self, now: Instant) -> Vec<String> {
         self.leases
             .values()
-            .filter(|lease| now.duration_since(lease.last_used).as_secs() > IDLE_SECONDS)
+            .filter(|lease| {
+                !lease.closing && now.duration_since(lease.last_used).as_secs() > IDLE_SECONDS
+            })
             .map(|lease| lease.session.clone())
             .collect()
     }
@@ -637,6 +686,38 @@ mod tests {
         state.ensure("root/task-1", 3).unwrap();
         state.ensure("root/task-1", 4).unwrap();
         assert!(state.ensure("root/task-1", 5).is_err());
+    }
+
+    #[test]
+    fn sweeper_claims_only_untouched_leases() {
+        use std::time::{Duration, Instant};
+        let mut state = root_state();
+        let (s1, _) = state.ensure("a", 1).unwrap();
+        // Fresh (initializing) leases are never claimed.
+        assert!(!state.try_claim_close(&s1, Instant::now()));
+        state.mark_ready(&s1);
+        // Just touched: not idle.
+        assert!(!state.try_claim_close(&s1, Instant::now()));
+        // Old enough: claimed once, and hidden from idle while claimed.
+        let old = Instant::now() - Duration::from_secs(IDLE_SECONDS + 1);
+        state.leases.get_mut(&s1).unwrap().last_used = old;
+        assert!(state.try_claim_close(&s1, Instant::now()));
+        assert!(!state.try_claim_close(&s1, Instant::now()));
+        assert!(state.idle(Instant::now()).is_empty());
+        assert!(state.is_closing(&s1));
+        // A call starting mid-close touches: the re-check fails, the claim
+        // is released and the lease survives.
+        state.touch(&s1);
+        assert!(!state.still_idle(&s1, old));
+        state.unclaim(&s1);
+        assert!(!state.is_closing(&s1));
+        // Untouched: the re-check passes and removal clears the slot.
+        state.leases.get_mut(&s1).unwrap().last_used = old;
+        let check = Instant::now();
+        assert!(state.try_claim_close(&s1, check));
+        assert!(state.still_idle(&s1, check));
+        state.remove_session(&s1);
+        assert!(state.resolve("a", 1).is_err());
     }
 
     #[test]

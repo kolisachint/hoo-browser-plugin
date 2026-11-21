@@ -499,6 +499,16 @@ impl Helper {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let (session, fresh) = self.inner.state.lock().await.ensure(agent_id, tab)?;
+            // Touch at call start (M7): the sweeper skips anything touched
+            // within the idle window, so a call in flight is never reaped.
+            let closing = {
+                let mut state = self.inner.state.lock().await;
+                state.touch(&session);
+                state.is_closing(&session)
+            };
+            if closing {
+                return Err(HooError::Failed(format!("tab {tab} is closing; try again")));
+            }
             if fresh {
                 match self.open_window(&session).await {
                     Ok(()) => {
@@ -544,9 +554,11 @@ impl Helper {
         if tool == "browser_tabs" {
             return self.run_tabs(agent, args).await;
         }
+        // Time from request entry (M5): lease acquisition counts as helper
+        // overhead, not child time.
+        let started = std::time::Instant::now();
         let tab = tab_of(args)?;
         let session = self.acquire(&agent.agent_id, tab).await?;
-        let started = std::time::Instant::now();
         let (child, output) = if tool == "browser_screenshot" {
             self.run_screenshot(&session, args).await
         } else {
@@ -720,9 +732,20 @@ impl Helper {
     ) -> Result<Vec<ContentBlock>, HooError> {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         let started = std::time::Instant::now();
+        // Child (spawn+connect) time is measured per call, never equated
+        // with the total: the old `child: total` logged a permanent zero
+        // overhead (M5).
+        let mut child = std::time::Duration::ZERO;
         let output: Result<Value, HooError> = match action {
             "list" => {
                 let owned = self.inner.state.lock().await.owned(&agent.agent_id);
+                // A listing in flight touches its leases (M7).
+                {
+                    let mut state = self.inner.state.lock().await;
+                    for session in &owned {
+                        state.touch(session);
+                    }
+                }
                 let mut tabs = Vec::new();
                 for session in owned {
                     let argv = exec::tool_argv(
@@ -733,7 +756,10 @@ impl Helper {
                         &serde_json::json!({"action": "list"}),
                         None,
                     )?;
-                    match exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await {
+                    let call_started = std::time::Instant::now();
+                    let result = exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await;
+                    child += call_started.elapsed();
+                    match result {
                         Ok(data) => tabs.push(
                             serde_json::json!({"session": session, "tabs": data.get("tabs")}),
                         ),
@@ -757,7 +783,9 @@ impl Helper {
                 // The lease's window/tab goes first (H4, best effort),
                 // then `close`, whose failure the caller sees.
                 let tab_close = self.session_argv(&session, &["tab", "close"]);
+                let call_started = std::time::Instant::now();
                 let _ = exec::run_command(&tab_close, CALL_TIMEOUT, &self.inner.sock_dir).await;
+                child += call_started.elapsed();
                 let argv = exec::tool_argv(
                     &self.inner.agent_browser,
                     &self.inner.cdp,
@@ -766,7 +794,9 @@ impl Helper {
                     &serde_json::json!({"action": "close"}),
                     None,
                 )?;
+                let call_started = std::time::Instant::now();
                 exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await?;
+                child += call_started.elapsed();
                 self.inner
                     .state
                     .lock()
@@ -802,7 +832,7 @@ impl Helper {
                 agent: &agent.agent_id,
                 session: "-",
                 total,
-                child: total,
+                child,
                 ok: error.is_none(),
                 error: error.as_deref(),
             },
@@ -976,18 +1006,36 @@ impl ServerHandler for Helper {
 }
 
 /// Idle sweeper: every minute, close leases idle over the limit.
+/// Idle sweeper: every minute, close leases idle over the limit (M7).
+/// The check-then-claim protocol closes nothing a call touched: the sweep
+/// notes the time, claims only leases untouched since then, closes them
+/// browser-side, and re-checks before removal. A call starting mid-close
+/// touches its lease, so the re-check fails and the lease survives (the
+/// claim is released).
 pub async fn sweep_loop(helper: Helper) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         interval.tick().await;
+        let check = std::time::Instant::now();
         let idle = {
             let state = helper.inner.state.lock().await;
-            state.idle(std::time::Instant::now())
+            state.idle(check)
         };
         for session in idle {
+            let claimed = {
+                let mut state = helper.inner.state.lock().await;
+                state.try_claim_close(&session, check)
+            };
+            if !claimed {
+                continue;
+            }
             helper.close_session(&session).await;
             let mut state = helper.inner.state.lock().await;
-            let _ = state.close("root", &session);
+            if state.still_idle(&session, check) {
+                state.remove_session(&session);
+            } else {
+                state.unclaim(&session);
+            }
         }
     }
 }

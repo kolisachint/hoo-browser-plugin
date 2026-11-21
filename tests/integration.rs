@@ -411,8 +411,8 @@ fn overhead_report_exists_after_fake_calls() {
         };
         for line in text.lines() {
             if let Ok(value) = serde_json::from_str::<Value>(line) {
-                if let Some(ms) = value.get("overhead_ms").and_then(Value::as_u64) {
-                    overheads.push(ms as u128);
+                if let Some(us) = value.get("overhead_us").and_then(Value::as_u64) {
+                    overheads.push(us as u128);
                 }
             }
         }
@@ -424,7 +424,7 @@ fn overhead_report_exists_after_fake_calls() {
     overheads.sort_unstable();
     let pick = |p: f64| overheads[((overheads.len() as f64 * p) as usize).min(overheads.len() - 1)];
     println!(
-        "overhead_ms over {} calls: p50={} p95={} max={}",
+        "overhead_us over {} calls: p50={} p95={} max={} (see scripts/overhead.py)",
         overheads.len(),
         pick(0.5),
         pick(0.95),
@@ -719,14 +719,18 @@ async fn real_no_steal_suite() {
 fn report_overheads(dir: &Path) {
     let text = std::fs::read_to_string(dir.join("hoo-browser.log")).unwrap_or_default();
     let mut overheads: Vec<u128> = Vec::new();
+    let mut children: Vec<u128> = Vec::new();
     let mut totals: Vec<u128> = Vec::new();
     for line in text.lines() {
         if let Ok(value) = serde_json::from_str::<Value>(line) {
-            if let Some(ms) = value.get("overhead_ms").and_then(Value::as_u64) {
-                overheads.push(ms as u128);
+            if let Some(us) = value.get("overhead_us").and_then(Value::as_u64) {
+                overheads.push(us as u128);
             }
-            if let Some(ms) = value.get("total_ms").and_then(Value::as_u64) {
-                totals.push(ms as u128);
+            if let Some(us) = value.get("child_us").and_then(Value::as_u64) {
+                children.push(us as u128);
+            }
+            if let Some(us) = value.get("total_us").and_then(Value::as_u64) {
+                totals.push(us as u128);
             }
         }
     }
@@ -735,14 +739,17 @@ fn report_overheads(dir: &Path) {
         return;
     }
     overheads.sort_unstable();
+    children.sort_unstable();
     totals.sort_unstable();
     let pick = |v: &[u128], p: f64| v[((v.len() as f64 * p) as usize).min(v.len() - 1)];
     println!(
-        "overhead_ms over {} calls: p50={} p95={} max={} | total_ms p50={} p95={}",
+        "calls={} helper-only overhead_us p50={} p95={} max={} | spawn+connect child_us p50={} p95={} | total_us p50={} p95={} (see scripts/overhead.py)",
         overheads.len(),
         pick(&overheads, 0.5),
         pick(&overheads, 0.95),
         overheads.last().unwrap(),
+        pick(&children, 0.5),
+        pick(&children, 0.95),
         pick(&totals, 0.5),
         pick(&totals, 0.95),
     );
