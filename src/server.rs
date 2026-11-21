@@ -507,8 +507,12 @@ impl Helper {
     /// first call on a new tab runs `window new`; if that fails the lease is
     /// rolled back so no phantom tab survives; concurrent first calls on a
     /// new tab wait for the creator instead of opening duplicate windows.
-    async fn acquire(&self, agent_id: &str, tab: usize) -> Result<String, HooError> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    async fn acquire(
+        &self,
+        agent_id: &str,
+        tab: usize,
+        deadline: std::time::Instant,
+    ) -> Result<String, HooError> {
         loop {
             let (session, fresh) = self.inner.state.lock().await.ensure(agent_id, tab)?;
             // Touch at call start (M7): the sweeper skips anything touched
@@ -522,7 +526,10 @@ impl Helper {
                 return Err(HooError::Failed(format!("tab {tab} is closing; try again")));
             }
             if fresh {
-                match self.open_window(&session).await {
+                match self
+                    .open_window(&session, exec::spawn_timeout(deadline)?)
+                    .await
+                {
                     Ok(()) => {
                         self.inner.state.lock().await.mark_ready(&session);
                         return Ok(session);
@@ -569,10 +576,13 @@ impl Helper {
         // Time from request entry (M5): lease acquisition counts as helper
         // overhead, not child time.
         let started = std::time::Instant::now();
+        // One budget for the whole call (M1): acquire-wait, window new and
+        // the command share it instead of stacking timeouts.
+        let deadline = started + exec::CALL_BUDGET;
         let tab = tab_of(args)?;
-        let session = self.acquire(&agent.agent_id, tab).await?;
+        let session = self.acquire(&agent.agent_id, tab, deadline).await?;
         let (child, output) = if tool == "browser_screenshot" {
-            self.run_screenshot(&session, args).await
+            self.run_screenshot(&session, args, deadline).await
         } else {
             let argv = exec::tool_argv(
                 &self.inner.agent_browser,
@@ -583,7 +593,9 @@ impl Helper {
                 None,
             )?;
             let child_started = std::time::Instant::now();
-            let data = exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await;
+            let data =
+                exec::run_command(&argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir)
+                    .await;
             (child_started.elapsed(), data.map(ExecOutput::Json))
         };
         let total = started.elapsed();
@@ -636,13 +648,14 @@ impl Helper {
                     .ok_or_else(|| HooError::Refused("browser_cli args must be strings".into()))
             })
             .collect::<Result<_, _>>()?;
-        let default_session = self.acquire(&agent.agent_id, 1).await?;
+        let deadline = started + exec::CALL_BUDGET;
+        let default_session = self.acquire(&agent.agent_id, 1, deadline).await?;
         let owned = self.inner.state.lock().await.owned(&agent.agent_id);
         let scoped = exec::scope_cli_args(&raw, &self.inner.cdp, &default_session, &owned)?;
         let mut full = vec![self.inner.agent_browser.to_string_lossy().into_owned()];
         full.extend(scoped);
         let child_started = std::time::Instant::now();
-        let text = self.run_raw(&full).await;
+        let text = self.run_raw(&full, exec::spawn_timeout(deadline)?).await;
         let child = child_started.elapsed();
         let total = started.elapsed();
         let error = match &text {
@@ -666,9 +679,13 @@ impl Helper {
     }
 
     /// Give a fresh lease its own window on the shared browser.
-    async fn open_window(&self, session: &str) -> Result<(), HooError> {
+    async fn open_window(
+        &self,
+        session: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), HooError> {
         let argv = self.session_argv(session, &["window", "new"]);
-        exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await?;
+        exec::run_command(&argv, timeout, &self.inner.sock_dir).await?;
         Ok(())
     }
 
@@ -676,6 +693,7 @@ impl Helper {
         &self,
         session: &str,
         args: &Value,
+        deadline: std::time::Instant,
     ) -> (std::time::Duration, Result<ExecOutput, HooError>) {
         let _ = crate::backend::ensure_dir_0700(&self.inner.data_dir.join("shots"));
         let path = exec::shot_path(&self.inner.data_dir);
@@ -691,7 +709,10 @@ impl Helper {
             Err(e) => return (std::time::Duration::ZERO, Err(e)),
         };
         let child_started = std::time::Instant::now();
-        let result = exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await;
+        let result = match exec::spawn_timeout(deadline) {
+            Ok(timeout) => exec::run_command(&argv, timeout, &self.inner.sock_dir).await,
+            Err(e) => Err(e),
+        };
         let child = child_started.elapsed();
         let output = result.and_then(|_| {
             std::fs::read(&path).map(ExecOutput::Png).map_err(|e| {
@@ -706,7 +727,11 @@ impl Helper {
     }
 
     /// Raw passthrough for `browser_cli`: stdout is returned as text.
-    async fn run_raw(&self, scoped: &[String]) -> Result<String, HooError> {
+    async fn run_raw(
+        &self,
+        scoped: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<String, HooError> {
         use tokio::process::Command;
         let (program, args) = scoped
             .split_first()
@@ -717,12 +742,12 @@ impl Helper {
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         exec::child_env(&mut child, Some(&self.inner.sock_dir));
-        let output = tokio::time::timeout(exec::call_timeout(), child.output())
+        let output = tokio::time::timeout(timeout, child.output())
             .await
             .map_err(|_| {
                 HooError::Spawn(format!(
                     "agent-browser timed out after {}s",
-                    exec::call_timeout().as_secs()
+                    timeout.as_secs()
                 ))
             })?
             .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
@@ -744,6 +769,7 @@ impl Helper {
     ) -> Result<Vec<ContentBlock>, HooError> {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         let started = std::time::Instant::now();
+        let deadline = started + exec::CALL_BUDGET;
         // Child (spawn+connect) time is measured per call, never equated
         // with the total: the old `child: total` logged a permanent zero
         // overhead (M5).
@@ -768,9 +794,17 @@ impl Helper {
                         &serde_json::json!({"action": "list"}),
                         None,
                     )?;
+                    let timeout = match exec::spawn_timeout(deadline) {
+                        Ok(timeout) => timeout,
+                        Err(e) => {
+                            tabs.push(
+                                serde_json::json!({"session": session, "error": e.to_string()}),
+                            );
+                            break;
+                        }
+                    };
                     let call_started = std::time::Instant::now();
-                    let result =
-                        exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await;
+                    let result = exec::run_command(&argv, timeout, &self.inner.sock_dir).await;
                     child += call_started.elapsed();
                     match result {
                         Ok(data) => tabs.push(
@@ -797,8 +831,9 @@ impl Helper {
                 // then `close`, whose failure the caller sees.
                 let tab_close = self.session_argv(&session, &["tab", "close"]);
                 let call_started = std::time::Instant::now();
-                let _ =
-                    exec::run_command(&tab_close, exec::call_timeout(), &self.inner.sock_dir).await;
+                if let Ok(timeout) = exec::spawn_timeout(deadline) {
+                    let _ = exec::run_command(&tab_close, timeout, &self.inner.sock_dir).await;
+                }
                 child += call_started.elapsed();
                 let argv = exec::tool_argv(
                     &self.inner.agent_browser,
@@ -809,7 +844,8 @@ impl Helper {
                     None,
                 )?;
                 let call_started = std::time::Instant::now();
-                exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await?;
+                exec::run_command(&argv, exec::spawn_timeout(deadline)?, &self.inner.sock_dir)
+                    .await?;
                 child += call_started.elapsed();
                 self.inner
                     .state
@@ -914,13 +950,15 @@ fn kill_tree(child: &tokio::process::Child) {
     };
     let pid = pid as libc::pid_t;
     // SAFETY: SIGKILL to our own child only.
-    unsafe {
+    let group_killed = unsafe {
         let pgid = libc::getpgid(pid);
-        if pgid == pid && pgid != libc::getpgrp() {
-            if libc::killpg(pid, libc::SIGKILL) == 0 {
-                return;
-            }
-        }
+        pgid == pid && pgid != libc::getpgrp() && libc::killpg(pid, libc::SIGKILL) == 0
+    };
+    if group_killed {
+        return;
+    }
+    // SAFETY: SIGKILL to our own child only.
+    unsafe {
         let _ = libc::kill(pid, libc::SIGKILL);
     }
 }

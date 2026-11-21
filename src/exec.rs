@@ -5,7 +5,7 @@
 //! per call at debug level to the log file (never with tokens).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::process::Command;
@@ -15,6 +15,25 @@ use crate::error::{short_stderr, HooError};
 /// Per-call timeout for the agent-browser child, under hoocode's 60 s
 /// tool budget (M1). `browser_wait` is capped below this (see MAX_WAIT_MS).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Total budget for one tool call (M1): acquire-wait + window new + the
+/// command share it, so a call can never run 3x the per-spawn timeout.
+/// Under hoocode's 60 s tool budget with headroom.
+pub const CALL_BUDGET: Duration = Duration::from_secs(50);
+
+/// Timeout for one spawn, bounded by the call budget: the smaller of the
+/// per-spawn cap and the time left on the deadline. Zero remaining means
+/// the budget is spent — fail without spawning.
+pub fn spawn_timeout(deadline: Instant) -> Result<Duration, HooError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout = remaining.min(call_timeout());
+    if timeout.is_zero() {
+        return Err(HooError::Spawn(
+            "agent-browser call budget exhausted".into(),
+        ));
+    }
+    Ok(timeout)
+}
 
 /// Effective per-call timeout. `HOO_BROWSER_CALL_TIMEOUT_SECS` overrides it;
 /// that hook exists for the timeout test (a 45 s test would be absurd) and
@@ -843,7 +862,12 @@ mod tests {
     #[test]
     fn call_timeout_fits_hoocode_budget_and_wait_is_capped() {
         assert!(CALL_TIMEOUT.as_secs() < 60);
+        assert!(CALL_BUDGET.as_secs() < 60);
         assert!(Duration::from_millis(MAX_WAIT_MS) < CALL_TIMEOUT);
+        let plenty = Instant::now() + Duration::from_secs(3600);
+        assert!(spawn_timeout(plenty).unwrap() <= CALL_TIMEOUT);
+        let spent = Instant::now() - Duration::from_secs(1);
+        assert!(spawn_timeout(spent).is_err());
         assert!(tool_argv(
             Path::new("ab"),
             "e",
