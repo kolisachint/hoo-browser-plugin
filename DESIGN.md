@@ -59,6 +59,21 @@ hoocode at session end; cleaned at startup). The browser profile is
 a fresh profile in its runtime dir. Every lease carries `--pin-tab` so its
 background window never takes focus (upstream AB-1).
 
+## Modes: scoped vs safe
+
+Chosen once at startup by probing `agent-browser --version`
+(`HOO_BROWSER_AB_SCOPED=1/0` forces it for tests). **Scoped** (the hoo
+fork: releases carry `-hoo.N` versions like `0.43.1-hoo.1`) scopes
+`--pin-tab` sessions' `tab list`/switch to their owned tabs, so listings
+pass through and lease close removes every listed target (bound, opened,
+adopted popups) via DevTools `/json/close`. **Safe** (upstream
+agent-browser, whose `tab list` shows the whole shared browser): the
+lease binds the target its window opened with (matched by `tabId`, never
+the live `active` flag); closes remove only that bound target,
+`browser_tabs list` returns only the lease's own bound entry per tab
+slot, and `browser_cli tab` is refused. Full isolation needs the fork.
+Safe mode logs a one-line warning at startup.
+
 ## Later (from the old chromiumoxide driver; not committed scope)
 
 - Deterministic replay: record a flow once, replay it with zero LLM calls,

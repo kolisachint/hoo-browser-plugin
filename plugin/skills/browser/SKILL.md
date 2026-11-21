@@ -31,6 +31,10 @@ in `value` (`Enter`, `Escape`) and falls back to `ref`.
 - **`browser_tabs {action: "list"}`** shows your tabs; `{action: "close",
   tab}` closes one. Root only: `{action: "adopt", from}` takes another
   agent's tabs when it ends.
+- Isolation: with the fork agent-browser the helper runs scoped (listings
+  show your tabs, closes remove all of them); with upstream it runs safe
+  (only your own bound tab, ever — other agents' tabs and URLs stay
+  hidden, and `cli tab list` is refused).
 
 ## Waiting and reading
 

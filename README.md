@@ -19,6 +19,12 @@ agent-browser needed to build; both resolve at runtime:
   AB-1..AB-4 fixes before its first release), point `HOO_BROWSER_AGENT_BROWSER`
   at the built binary — this is the supported route until the pinned fork
   release exists (see `backend.rs`).
+- Two modes (see `DESIGN.md`): **scoped** when the agent-browser is the hoo
+  fork (detected by `-hoo.` in `agent-browser --version`, e.g.
+  `0.43.1-hoo.1`), **safe** with upstream agent-browser. Full isolation
+  (listings pass through, closes take every owned target) needs the fork;
+  safe mode still isolates leases but conservatively (own bound tab only,
+  no `browser_cli tab`). Override for tests: `HOO_BROWSER_AB_SCOPED=1/0`.
 - Chromium: `HOO_BROWSER_CHROME` env, else agent-browser's own install
   (`~/.agent-browser/browsers/`), else common install paths.
 
