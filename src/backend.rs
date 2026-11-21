@@ -270,75 +270,95 @@ pub fn ensure_dir_0700(path: &Path) -> Result<(), HooError> {
     Ok(())
 }
 
-/// Is the pid in the profile lock still running? `kill(pid, 0)` checks
-/// without signalling; EPERM means alive but foreign (still held).
-fn lock_held_by_live_process(lock: &Path) -> bool {
-    let text = match std::fs::read_to_string(lock) {
-        Ok(text) => text,
-        // Unreadable: be conservative, someone else owns it.
-        Err(_) => return true,
-    };
-    let Ok(pid) = text.trim().parse::<libc::pid_t>() else {
-        return true;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 only checks.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+/// An exclusive, non-blocking `flock` on the profile lock file, held open
+/// for the helper's lifetime (N4). The kernel releases it when the holder
+/// dies, so stale locks are impossible — unlike the pid file this replaces,
+/// a crashed helper never blocks the next one. The file content (helper +
+/// Chromium pids) is observability only, never authority.
+pub struct ProfileLock {
+    _file: std::fs::File,
+    path: PathBuf,
 }
 
-/// Pick the Chromium profile: `PLUGIN_DATA/profile` while we hold its lock
-/// file, else a fresh profile in the per-session runtime dir (C3). A lock
-/// from a dead helper is stale and taken over; a live holder keeps the data
-/// profile and the log line says where this helper went instead.
+impl ProfileLock {
+    /// Record pids in the lock file for `ps`-level debugging. Best effort:
+    /// the lock itself is the open fd, not these bytes.
+    pub fn note_pids(&self, helper_pid: u32, chromium_pid: Option<u32>) {
+        use std::io::Write as _;
+        let mut content = format!("helper={helper_pid}\n");
+        if let Some(pid) = chromium_pid {
+            content.push_str(&format!("chromium={pid}\n"));
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&self.path) {
+            use std::io::Seek as _;
+            let _ = file.set_len(0);
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+            let _ = file.write_all(content.as_bytes());
+        }
+    }
+}
+
+/// Try to lock the profile dir: `Ok(Some)` while we hold it, `Ok(None)`
+/// when another live helper holds it (N4: `EWOULDBLOCK`, never stale).
+fn try_profile_lock(lock_path: &Path) -> Result<Option<ProfileLock>, HooError> {
+    use std::os::unix::io::AsRawFd as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_path)
+        .map_err(|e| HooError::Usage(format!("cannot open {}: {e}", lock_path.display())))?;
+    let start = std::time::Instant::now();
+    let held = loop {
+        // SAFETY: flock on our own open fd only.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break true;
+        }
+        let busy = std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK);
+        if !busy {
+            return Err(HooError::Usage(format!(
+                "cannot lock {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        if start.elapsed() > std::time::Duration::from_millis(50) {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    if !held {
+        return Ok(None);
+    }
+    let lock = ProfileLock {
+        _file: file,
+        path: lock_path.to_owned(),
+    };
+    lock.note_pids(std::process::id(), None);
+    Ok(Some(lock))
+}
+
+/// Pick the Chromium profile: `PLUGIN_DATA/profile` while we hold its
+/// `flock`, else a fresh profile in the per-session runtime dir (C3). A
+/// live holder keeps the data profile and the log line says where this
+/// helper went instead; a dead holder's lock is already gone (N4).
 fn select_profile(
     data_dir: &Path,
     runtime_dir: &Path,
-) -> Result<(PathBuf, Option<PathBuf>), HooError> {
+) -> Result<(PathBuf, Option<ProfileLock>), HooError> {
     let lock_path = data_dir.join("profile.lock");
-    let take = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path);
-    match take {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            let _ = writeln!(file, "{}", std::process::id());
-            Ok((data_dir.join("profile"), Some(lock_path)))
+    match try_profile_lock(&lock_path)? {
+        Some(lock) => Ok((data_dir.join("profile"), Some(lock))),
+        None => {
+            eprintln!(
+                "hoo-browser: profile {} is held by another helper; using a fresh profile in {}",
+                data_dir.display(),
+                runtime_dir.display()
+            );
+            let fresh = runtime_dir.join("profile");
+            let _ = std::fs::remove_dir_all(&fresh);
+            Ok((fresh, None))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if lock_held_by_live_process(&lock_path) {
-                eprintln!(
-                    "hoo-browser: profile {} is held by another helper; using a fresh profile in {}",
-                    data_dir.display(),
-                    runtime_dir.display()
-                );
-                let fresh = runtime_dir.join("profile");
-                let _ = std::fs::remove_dir_all(&fresh);
-                Ok((fresh, None))
-            } else {
-                // Stale lock from a dead helper: take the profile over.
-                let _ = std::fs::remove_file(&lock_path);
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock_path)
-                    .map_err(|e| {
-                        HooError::Usage(format!("cannot lock {}: {e}", lock_path.display()))
-                    })?;
-                use std::io::Write as _;
-                let _ = writeln!(file, "{}", std::process::id());
-                Ok((data_dir.join("profile"), Some(lock_path)))
-            }
-        }
-        Err(e) => Err(HooError::Usage(format!(
-            "cannot lock {}: {e}",
-            lock_path.display()
-        ))),
     }
 }
 
@@ -348,9 +368,9 @@ pub struct Chromium {
     pub child: tokio::process::Child,
     /// `ws://127.0.0.1:<port>/devtools/browser/...`, passed as `--cdp`.
     pub endpoint: String,
-    /// Lock file this helper holds for the data-dir profile, removed on
+    /// Lock this helper holds for the data-dir profile, released on
     /// shutdown; `None` when we fell back to the runtime-dir profile.
-    pub profile_lock: Option<PathBuf>,
+    pub profile_lock: Option<ProfileLock>,
 }
 
 /// Launch Chromium headless (or headed) and wait for the DevTools endpoint
@@ -523,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_lock_second_helper_falls_back_and_stale_is_taken() {
+    fn profile_lock_second_helper_falls_back_and_release_reacquires() {
         let base = std::env::temp_dir().join(format!("hoo-prof-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let data = base.join("data");
@@ -533,15 +553,18 @@ mod tests {
         let (profile, lock) = super::select_profile(&data, &runtime).unwrap();
         assert_eq!(profile, data.join("profile"));
         assert!(lock.is_some());
-        // Second helper (same process: pid alive) falls back to runtime.
+        // A second holder (even in this process: flock conflicts per open
+        // file description) falls back to the runtime profile.
         let (profile2, lock2) = super::select_profile(&data, &runtime).unwrap();
         assert_eq!(profile2, runtime.join("profile"));
         assert!(lock2.is_none());
-        // A stale lock from a dead helper is taken over.
-        std::fs::write(data.join("profile.lock"), "2147483647\n").unwrap();
+        // Dropping the guard releases the lock: the next helper takes the
+        // data profile again. No stale state survives a dead holder (N4).
+        drop(lock);
         let (profile3, lock3) = super::select_profile(&data, &runtime).unwrap();
         assert_eq!(profile3, data.join("profile"));
         assert!(lock3.is_some());
+        drop(lock3);
         let _ = std::fs::remove_dir_all(&base);
     }
 

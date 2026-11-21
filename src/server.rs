@@ -92,7 +92,7 @@ pub struct Inner {
     pub chromium: Mutex<Option<tokio::process::Child>>,
     /// Profile lock file this helper holds, removed on shutdown (C3).
     /// `None` when the data profile was busy and we used the runtime one.
-    pub profile_lock: Mutex<Option<PathBuf>>,
+    pub profile_lock: Mutex<Option<crate::backend::ProfileLock>>,
 }
 
 impl Helper {
@@ -122,7 +122,11 @@ impl Helper {
     }
 
     /// Hand the shared Chromium to the helper so shutdown kills it.
-    pub async fn set_chromium(&self, child: tokio::process::Child, profile_lock: Option<PathBuf>) {
+    pub async fn set_chromium(
+        &self,
+        child: tokio::process::Child,
+        profile_lock: Option<crate::backend::ProfileLock>,
+    ) {
         *self.inner.chromium.lock().await = Some(child);
         *self.inner.profile_lock.lock().await = profile_lock;
     }
@@ -143,9 +147,8 @@ impl Helper {
             }
             let _ = child.wait().await;
         }
-        if let Some(lock) = self.inner.profile_lock.lock().await.take() {
-            let _ = std::fs::remove_file(&lock);
-        }
+        // Dropping the guard closes the fd and releases the flock (N4).
+        let _ = self.inner.profile_lock.lock().await.take();
     }
 
     /// The agent record for a bearer token, if known.
