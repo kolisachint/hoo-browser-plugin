@@ -457,7 +457,11 @@ fn fake_wrapper(dir: &Path, argv_log: &Path, fail_file: Option<&Path>) -> PathBu
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
     let path = dir.join("fake-wrapper.sh");
-    let mut script = format!("#!/bin/bash\nexport FAKE_ARGV_LOG={}\n", sh_quote(argv_log));
+    let mut script = format!(
+        "#!/bin/bash\nexport FAKE_ARGV_LOG={}\nexport FAKE_ENV_LOG={}.env\n",
+        sh_quote(argv_log),
+        sh_quote(argv_log)
+    );
     if let Some(fail) = fail_file {
         script.push_str(&format!("export FAKE_FAIL_FILE={}\n", sh_quote(fail)));
     }
@@ -547,6 +551,61 @@ async fn fake_every_call_carries_session_and_pin_tab() {
         lines.iter().all(|l| l.contains("root_task-1-")),
         "no call escapes the agent's leases: {lines:?}"
     );
+}
+
+#[tokio::test]
+async fn fake_agent_browser_config_is_helper_owned() {
+    // N6: every agent-browser child runs with `AGENT_BROWSER_CONFIG`
+    // pointing at a helper-owned file containing `{}`, so the user's
+    // `~/.agent-browser/config.json` cannot change helper output.
+    let dir = test_tmp("config");
+    let argv_log = dir.join("argv.log");
+    let env_log = dir.join("argv.log.env");
+    let fake = fake_wrapper(&dir, &argv_log, None);
+    let (_helper, socket) = start_helper(&fake, &dir).await;
+    let peer = connect(&socket, ROOT_TOKEN).await;
+    call(
+        &peer,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    call(&peer, "browser_snapshot", serde_json::json!({}))
+        .await
+        .expect("snapshot");
+    let argv_calls = argv_lines(&argv_log);
+    let env_lines: Vec<String> = std::fs::read_to_string(&env_log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        env_lines.len(),
+        argv_calls.len(),
+        "every child must log its config env: {env_lines:?} vs {argv_calls:?}"
+    );
+    assert!(!env_lines.is_empty());
+    for line in &env_lines {
+        assert!(
+            line.ends_with("agent-browser-config.json"),
+            "config must be the helper-owned file, got: {line}"
+        );
+        let content = std::fs::read_to_string(line.trim())
+            .unwrap_or_else(|e| panic!("cannot read {line}: {e}"));
+        assert_eq!(content.trim(), "{}", "helper config must be empty JSON");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(env_lines[0].trim())
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "helper config must be owner-only");
+    }
 }
 
 #[tokio::test]

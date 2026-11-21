@@ -19,6 +19,11 @@ if [ -n "${FAKE_ARGV_LOG:-}" ]; then
     printf '\n' >> "$FAKE_ARGV_LOG"
 fi
 
+# N6: record the config env every child sees, one line per call.
+if [ -n "${FAKE_ENV_LOG:-}" ]; then
+    printf '%s\n' "${AGENT_BROWSER_CONFIG:-<unset>}" >> "$FAKE_ENV_LOG"
+fi
+
 # Drop globals (--cdp/--session and their values, --json/--pin-tab) so only
 # the command remains. The session is captured for the fail hook.
 args=()

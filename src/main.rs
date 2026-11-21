@@ -130,6 +130,13 @@ async fn run() -> Result<(), HooError> {
     let sock_dir = backend::socket_dir(&runtime);
     let _ = std::fs::remove_dir_all(&sock_dir);
     backend::ensure_dir_0700(&sock_dir)?;
+    // N6: the helper-owned agent-browser config lives here (0600,
+    // containing `{}`), so user config cannot change helper output.
+    hoo_browser::exec::ensure_agent_browser_config(&sock_dir).map_err(|e| {
+        HooError::Usage(format!(
+            "cannot create the helper-owned agent-browser config: {e}"
+        ))
+    })?;
 
     let backend_kind = backend::Backend::from_env();
     backend_kind.check_supported()?;

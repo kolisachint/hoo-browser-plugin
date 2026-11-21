@@ -57,8 +57,8 @@ pub const IDLE_TIMEOUT_MS: &str = "600000";
 
 /// Children must never inherit secrets or ambient overrides (L1): the helper
 /// and agent tokens stay in the helper, and every `AGENT_BROWSER_*` var is
-/// dropped except the two the helper sets itself (socket isolation and the
-/// idle timeout above).
+/// dropped except the ones the helper sets itself (socket isolation, the
+/// idle timeout below, and the helper-owned config from N6).
 pub fn child_env(cmd: &mut tokio::process::Command, sock_dir: Option<&std::path::Path>) {
     for (key, _) in std::env::vars() {
         if key == "HOOCODE_HELPER_TOKEN"
@@ -71,7 +71,39 @@ pub fn child_env(cmd: &mut tokio::process::Command, sock_dir: Option<&std::path:
     cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", IDLE_TIMEOUT_MS);
     if let Some(dir) = sock_dir {
         cmd.env("AGENT_BROWSER_SOCKET_DIR", dir);
+        // N6: point every child at the helper-owned config so the user's
+        // `~/.agent-browser/config.json` cannot change helper output
+        // (e.g. screenshotFormat). Re-ensured here (best effort) so direct
+        // `Helper` users get it too; startup creates it fatally.
+        if let Ok(path) = ensure_agent_browser_config(dir) {
+            cmd.env("AGENT_BROWSER_CONFIG", path);
+        }
     }
+}
+
+/// Path of the helper-owned agent-browser config (N6): a file containing
+/// `{}` in the runtime/socket dir, so ambient user config cannot change
+/// helper output.
+pub fn agent_browser_config_path(sock_dir: &Path) -> PathBuf {
+    sock_dir.join("agent-browser-config.json")
+}
+
+/// Create the helper-owned config if missing: `{}` with owner-only
+/// permissions. The socket dir itself is 0700 (main) or created here.
+pub fn ensure_agent_browser_config(sock_dir: &Path) -> std::io::Result<PathBuf> {
+    let path = agent_browser_config_path(sock_dir);
+    if !path.is_file() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, "{}\n")?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(path)
 }
 
 /// What a tool call produced: plain JSON or a PNG for MCP image content.
