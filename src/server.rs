@@ -87,9 +87,12 @@ pub struct Inner {
     /// agent-browser daemon isolation (see ).
     pub sock_dir: PathBuf,
     /// The shared Chromium. Killed explicitly on shutdown: `process::exit`
-    /// skips destructors, so `kill_on_drop` alone would orphan it (and its
+    /// skips destructors, so `kill_on_drop` alone would orphan it (and the
     /// profile lock) on the sessionEnding/parent-death paths.
     pub chromium: Mutex<Option<tokio::process::Child>>,
+    /// Profile lock file this helper holds, removed on shutdown (C3).
+    /// `None` when the data profile was busy and we used the runtime one.
+    pub profile_lock: Mutex<Option<PathBuf>>,
 }
 
 impl Helper {
@@ -97,14 +100,13 @@ impl Helper {
         agent_browser: PathBuf,
         cdp: String,
         data_dir: PathBuf,
+        sock_dir: PathBuf,
         root_token: String,
         root_agent: String,
     ) -> Self {
         let mut state = State::default();
         state.register_root(root_token, root_agent);
         let log_path = data_dir.join("hoo-browser.log");
-        let sock_dir = crate::backend::socket_dir(&data_dir);
-        let _ = std::fs::create_dir_all(&sock_dir);
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
@@ -114,20 +116,35 @@ impl Helper {
                 log_path,
                 sock_dir,
                 chromium: Mutex::new(None),
+                profile_lock: Mutex::new(None),
             }),
         }
     }
 
     /// Hand the shared Chromium to the helper so shutdown kills it.
-    pub async fn set_chromium(&self, child: tokio::process::Child) {
+    pub async fn set_chromium(&self, child: tokio::process::Child, profile_lock: Option<PathBuf>) {
         *self.inner.chromium.lock().await = Some(child);
+        *self.inner.profile_lock.lock().await = profile_lock;
     }
 
     /// Kill the shared Chromium, best effort. Runs before every
     /// `process::exit`: destructors do not run there.
     pub async fn shutdown(&self) {
         if let Some(mut child) = self.inner.chromium.lock().await.take() {
+            // The main process first, then its whole group: Chromium's
+            // windowed subprocesses would otherwise survive (M9), keeping
+            // the profile locked for the next helper.
             let _ = child.kill().await;
+            if let Some(pid) = child.id() {
+                // SAFETY: killpg on our own child's group only.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let _ = child.wait().await;
+        }
+        if let Some(lock) = self.inner.profile_lock.lock().await.take() {
+            let _ = std::fs::remove_file(&lock);
         }
     }
 
@@ -636,7 +653,7 @@ impl Helper {
         session: &str,
         args: &Value,
     ) -> (std::time::Duration, Result<ExecOutput, HooError>) {
-        let _ = std::fs::create_dir_all(self.inner.data_dir.join("shots"));
+        let _ = crate::backend::ensure_dir_0700(&self.inner.data_dir.join("shots"));
         let path = exec::shot_path(&self.inner.data_dir);
         let argv = match exec::tool_argv(
             &self.inner.agent_browser,

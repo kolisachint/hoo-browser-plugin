@@ -204,10 +204,12 @@ fn agent_browser_chrome() -> Option<PathBuf> {
 
 /// Socket paths have an OS limit (macOS 104, Linux 108); hoocode's
 /// supervisor keeps them under 100 bytes and falls back to a hash name.
-/// Same rule here, two tiers: the daemon dir is `ab` under the data dir
-/// unless a session socket would pass the budget, then a stable hash of the
-/// data dir under the temp dir, then under `/tmp` (macOS TMPDIR alone is
-/// ~50 bytes, so the temp dir is not always short enough).
+/// Same rule here, two tiers: the daemon dir is `ab` under the per-session
+/// runtime dir (the helper socket's parent, C3: one daemon per hoocode
+/// session, removed with the session), unless a session socket would pass
+/// the budget, then a stable hash of the runtime dir under the temp dir,
+/// then under `/tmp` (macOS TMPDIR alone is ~50 bytes, so the temp dir is
+/// not always short enough).
 const MAX_SOCK_PATH: usize = 100;
 /// Budget for `/` + session name + `.sock` on top of the daemon dir.
 /// Worst lease name: 32-char id + `-` + tab + collision suffix.
@@ -228,12 +230,12 @@ fn fits(dir: &Path) -> bool {
     dir.to_string_lossy().len() + SESSION_BUDGET <= MAX_SOCK_PATH
 }
 
-pub fn socket_dir(data_dir: &Path) -> PathBuf {
-    let primary = data_dir.join("ab");
+pub fn socket_dir(runtime_dir: &Path) -> PathBuf {
+    let primary = runtime_dir.join("ab");
     if fits(&primary) {
         return primary;
     }
-    let hash = format!("hoo-{:016x}", fnv1a64(&data_dir.to_string_lossy()));
+    let hash = format!("hoo-{:016x}", fnv1a64(&runtime_dir.to_string_lossy()));
     let fallback = std::env::temp_dir().join(&hash);
     if fits(&fallback) {
         return fallback;
@@ -242,26 +244,134 @@ pub fn socket_dir(data_dir: &Path) -> PathBuf {
     PathBuf::from("/tmp").join(hash)
 }
 
+/// `mkdir -p` with 0700 and an owner check (M4): plugin-data dirs hold
+/// browsing state, so they must neither be world-readable nor owned by
+/// someone else. Pre-existing dirs are tightened, not just new ones.
+pub fn ensure_dir_0700(path: &Path) -> Result<(), HooError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(|e| HooError::Usage(format!("cannot create {}: {e}", path.display())))?;
+    let uid = std::fs::metadata(path)
+        .map_err(|e| HooError::Usage(format!("cannot stat {}: {e}", path.display())))?
+        .uid();
+    // SAFETY: getuid has no failure mode.
+    if uid != unsafe { libc::getuid() } {
+        return Err(HooError::Usage(format!(
+            "{} is owned by uid {uid}, refusing to share it",
+            path.display()
+        )));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| HooError::Usage(format!("cannot chmod 0700 {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Is the pid in the profile lock still running? `kill(pid, 0)` checks
+/// without signalling; EPERM means alive but foreign (still held).
+fn lock_held_by_live_process(lock: &Path) -> bool {
+    let text = match std::fs::read_to_string(lock) {
+        Ok(text) => text,
+        // Unreadable: be conservative, someone else owns it.
+        Err(_) => return true,
+    };
+    let Ok(pid) = text.trim().parse::<libc::pid_t>() else {
+        return true;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Pick the Chromium profile: `PLUGIN_DATA/profile` while we hold its lock
+/// file, else a fresh profile in the per-session runtime dir (C3). A lock
+/// from a dead helper is stale and taken over; a live holder keeps the data
+/// profile and the log line says where this helper went instead.
+fn select_profile(
+    data_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<(PathBuf, Option<PathBuf>), HooError> {
+    let lock_path = data_dir.join("profile.lock");
+    let take = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path);
+    match take {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{}", std::process::id());
+            Ok((data_dir.join("profile"), Some(lock_path)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if lock_held_by_live_process(&lock_path) {
+                eprintln!(
+                    "hoo-browser: profile {} is held by another helper; using a fresh profile in {}",
+                    data_dir.display(),
+                    runtime_dir.display()
+                );
+                let fresh = runtime_dir.join("profile");
+                let _ = std::fs::remove_dir_all(&fresh);
+                Ok((fresh, None))
+            } else {
+                // Stale lock from a dead helper: take the profile over.
+                let _ = std::fs::remove_file(&lock_path);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                    .map_err(|e| {
+                        HooError::Usage(format!("cannot lock {}: {e}", lock_path.display()))
+                    })?;
+                use std::io::Write as _;
+                let _ = writeln!(file, "{}", std::process::id());
+                Ok((data_dir.join("profile"), Some(lock_path)))
+            }
+        }
+        Err(e) => Err(HooError::Usage(format!(
+            "cannot lock {}: {e}",
+            lock_path.display()
+        ))),
+    }
+}
+
 /// A launched Chromium: the child plus its DevTools endpoint.
 pub struct Chromium {
     /// Owned by the helper after `set_chromium`; killed on shutdown.
     pub child: tokio::process::Child,
     /// `ws://127.0.0.1:<port>/devtools/browser/...`, passed as `--cdp`.
     pub endpoint: String,
+    /// Lock file this helper holds for the data-dir profile, removed on
+    /// shutdown; `None` when we fell back to the runtime-dir profile.
+    pub profile_lock: Option<PathBuf>,
 }
 
-/// Launch Chromium headless (or headed) with a fresh profile under the data
-/// dir and wait for the DevTools endpoint (spec B2).
+/// Launch Chromium headless (or headed) and wait for the DevTools endpoint
+/// (spec B2). The browser gets its own process group so shutdown can kill
+/// the whole tree, and its stderr drains to a log file after the endpoint
+/// line (L5) instead of filling a dead pipe.
 pub async fn launch_chromium(
     chrome: &Path,
     data_dir: &Path,
+    runtime_dir: &Path,
     headed: bool,
 ) -> Result<Chromium, HooError> {
-    let profile = data_dir.join("profile");
-    let _ = std::fs::create_dir_all(&profile);
+    let (profile, profile_lock) = select_profile(data_dir, runtime_dir)?;
+    ensure_dir_0700(&profile)?;
     let mut cmd = tokio::process::Command::new(chrome);
     // The browser inherits nothing secret or overriding (L1).
     crate::exec::child_env(&mut cmd, None);
+    // Its own process group: `killpg` in shutdown takes the whole tree.
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.as_std_mut().process_group(0);
+    }
     if !headed {
         cmd.arg("--headless=new");
     }
@@ -286,7 +396,12 @@ pub async fn launch_chromium(
         .ok_or_else(|| HooError::NoEndpoint("cannot read Chromium stderr".into()))?;
     let mut lines = BufReader::new(stderr).lines();
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
+    let endpoint = loop {
+        if Instant::now() >= deadline {
+            return Err(HooError::NoEndpoint(
+                "timed out waiting for the DevTools endpoint".into(),
+            ));
+        }
         let next = tokio::time::timeout(deadline - Instant::now(), lines.next_line())
             .await
             .map_err(|_| {
@@ -294,15 +409,54 @@ pub async fn launch_chromium(
             })?
             .map_err(|e| HooError::NoEndpoint(format!("cannot read Chromium stderr: {e}")))?;
         let Some(line) = next else {
-            break;
+            break None;
         };
         if let Some(endpoint) = parse_devtools_line(&line) {
-            return Ok(Chromium { child, endpoint });
+            break Some(endpoint);
         }
-    }
-    Err(HooError::NoEndpoint(
-        "Chromium exited without printing a DevTools endpoint".into(),
-    ))
+    };
+    let Some(endpoint) = endpoint else {
+        return Err(HooError::NoEndpoint(
+            "Chromium exited without printing a DevTools endpoint".into(),
+        ));
+    };
+    // Keep draining stderr to a log file: after the take above nobody reads
+    // the pipe, and a full pipe would stall the browser (L5).
+    let log_path = data_dir.join("chromium-stderr.log");
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut stderr = lines.into_inner();
+        let mut buf = vec![0u8; 8192];
+        let mut file: Option<tokio::fs::File> = None;
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if file.is_none() {
+                        file = tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log_path)
+                            .await
+                            .ok();
+                    }
+                    if let Some(file) = file.as_mut() {
+                        use tokio::io::AsyncWriteExt as _;
+                        if file.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(Chromium {
+        child,
+        endpoint,
+        profile_lock,
+    })
 }
 
 /// `DevTools listening on ws://127.0.0.1:9222/devtools/browser/...`.
@@ -345,6 +499,49 @@ mod tests {
         );
         // Stable: the same data dir maps to the same daemon dir.
         assert_eq!(fallback, socket_dir(long));
+    }
+
+    #[test]
+    fn dirs_are_0700_and_owned() {
+        let dir = std::env::temp_dir().join(format!("hoo-0700-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::ensure_dir_0700(&dir.join("nested")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir.join("nested"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "must be owner-only");
+        // Pre-existing loose dirs are tightened too.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::ensure_dir_0700(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_lock_second_helper_falls_back_and_stale_is_taken() {
+        let base = std::env::temp_dir().join(format!("hoo-prof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        let runtime = base.join("runtime");
+        std::fs::create_dir_all(&data).unwrap();
+        // First helper takes the data profile.
+        let (profile, lock) = super::select_profile(&data, &runtime).unwrap();
+        assert_eq!(profile, data.join("profile"));
+        assert!(lock.is_some());
+        // Second helper (same process: pid alive) falls back to runtime.
+        let (profile2, lock2) = super::select_profile(&data, &runtime).unwrap();
+        assert_eq!(profile2, runtime.join("profile"));
+        assert!(lock2.is_none());
+        // A stale lock from a dead helper is taken over.
+        std::fs::write(data.join("profile.lock"), "2147483647\n").unwrap();
+        let (profile3, lock3) = super::select_profile(&data, &runtime).unwrap();
+        assert_eq!(profile3, data.join("profile"));
+        assert!(lock3.is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

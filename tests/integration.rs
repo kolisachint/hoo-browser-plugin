@@ -38,6 +38,7 @@ async fn start_helper(agent_browser: &Path, data_dir: &Path) -> (Helper, PathBuf
         agent_browser.to_owned(),
         "ws://fake-endpoint-for-tests".into(),
         data_dir.to_owned(),
+        hoo_browser::backend::socket_dir(data_dir),
         ROOT_TOKEN.into(),
         "root".into(),
     );
@@ -531,13 +532,14 @@ async fn real_no_steal_suite() {
     };
     let dir = test_tmp("real");
     let chrome = hoo_browser::backend::locate_chromium().expect("chromium for IT");
-    let chromium = hoo_browser::backend::launch_chromium(&chrome, &dir, false)
+    let chromium = hoo_browser::backend::launch_chromium(&chrome, &dir, &dir, false)
         .await
         .expect("launch chromium");
     let helper = Helper::new(
         agent_browser,
         chromium.endpoint.clone(),
         dir.clone(),
+        hoo_browser::backend::socket_dir(&dir),
         ROOT_TOKEN.into(),
         "root".into(),
     );

@@ -9,7 +9,7 @@
 //!   `hoo-browser <args>` outside helper mode) calls the hidden `browser_cli`
 //!   tool on the live helper, scoped to the caller's sessions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hoo_browser::backend;
 use hoo_browser::client;
@@ -40,7 +40,12 @@ fn env_required(name: &str) -> Result<String, HooError> {
 
 /// The plugin data dir: `HOO_BROWSER_DATA` (from `mcp.json` env
 /// `${PLUGIN_DATA}`), else `PLUGIN_DATA`, else the temp dir.
-fn data_dir() -> PathBuf {
+/// The plugin data dir: `HOO_BROWSER_DATA` (from `mcp.json` env
+/// `${PLUGIN_DATA}`), else `PLUGIN_DATA`, else the per-session runtime dir
+/// (the helper socket's parent, removed by hoocode at session end). No
+/// `/tmp` fallback (M4): a predictable shared dir would leak browsing state
+/// across sessions and users.
+fn data_dir(runtime: &Path) -> PathBuf {
     for name in ["HOO_BROWSER_DATA", "PLUGIN_DATA"] {
         if let Ok(dir) = std::env::var(name) {
             let dir = PathBuf::from(dir);
@@ -49,7 +54,7 @@ fn data_dir() -> PathBuf {
             }
         }
     }
-    std::env::temp_dir().join("hoo-browser")
+    runtime.to_owned()
 }
 
 /// Split off `--parent-pid <pid>`; the rest are mcp.json args (ignored).
@@ -111,9 +116,20 @@ async fn run() -> Result<(), HooError> {
     let socket = PathBuf::from(env_required("HOOCODE_HELPER_SOCKET")?);
     let root_token = env_required("HOOCODE_HELPER_TOKEN")?;
     let root_agent = std::env::var("HOOCODE_AGENT_ID").unwrap_or_else(|_| "root".into());
-    let data_dir = data_dir();
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| HooError::Usage(format!("cannot create {}: {e}", data_dir.display())))?;
+    // The per-session runtime dir: the helper socket's parent, owned by
+    // hoocode and removed at session end (C3). No /tmp fallback (M4).
+    let runtime = socket
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_owned)
+        .ok_or_else(|| HooError::Usage("HOOCODE_HELPER_SOCKET has no parent dir".into()))?;
+    let data_dir = data_dir(&runtime);
+    backend::ensure_dir_0700(&data_dir)?;
+    // The daemon dir is per session and cleaned at startup, so a crashed
+    // helper's sockets never shadow the new daemon (H3).
+    let sock_dir = backend::socket_dir(&runtime);
+    let _ = std::fs::remove_dir_all(&sock_dir);
+    backend::ensure_dir_0700(&sock_dir)?;
 
     let backend_kind = backend::Backend::from_env();
     backend_kind.check_supported()?;
@@ -121,7 +137,7 @@ async fn run() -> Result<(), HooError> {
     let chrome = backend::locate_chromium()?;
     let headed = backend_kind == backend::Backend::ChromiumHeaded;
 
-    let chromium = backend::launch_chromium(&chrome, &data_dir, headed).await?;
+    let chromium = backend::launch_chromium(&chrome, &data_dir, &runtime, headed).await?;
     eprintln!(
         "hoo-browser: agent-browser={} chromium={} cdp={}",
         agent_browser.display(),
@@ -132,10 +148,13 @@ async fn run() -> Result<(), HooError> {
         agent_browser,
         chromium.endpoint.clone(),
         data_dir,
+        sock_dir,
         root_token,
         root_agent,
     );
-    helper.set_chromium(chromium.child).await;
+    helper
+        .set_chromium(chromium.child, chromium.profile_lock)
+        .await;
 
     // The helper dies with its parent (spec B2): close every lease first
     // so no windows strand on the shared browser, then kill Chromium
