@@ -103,7 +103,7 @@ impl Helper {
         let mut state = State::default();
         state.register_root(root_token, root_agent);
         let log_path = data_dir.join("hoo-browser.log");
-        let sock_dir = data_dir.join("ab-sockets");
+        let sock_dir = crate::backend::socket_dir(&data_dir);
         let _ = std::fs::create_dir_all(&sock_dir);
         Self {
             inner: Arc::new(Inner {

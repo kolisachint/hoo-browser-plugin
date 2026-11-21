@@ -202,6 +202,46 @@ fn agent_browser_chrome() -> Option<PathBuf> {
     None
 }
 
+/// Socket paths have an OS limit (macOS 104, Linux 108); hoocode's
+/// supervisor keeps them under 100 bytes and falls back to a hash name.
+/// Same rule here, two tiers: the daemon dir is `ab` under the data dir
+/// unless a session socket would pass the budget, then a stable hash of the
+/// data dir under the temp dir, then under `/tmp` (macOS TMPDIR alone is
+/// ~50 bytes, so the temp dir is not always short enough).
+const MAX_SOCK_PATH: usize = 100;
+/// Budget for `/` + session name + `.sock` on top of the daemon dir.
+/// Worst lease name: 32-char id + `-` + tab + collision suffix.
+const SESSION_BUDGET: usize = 1 + 40 + 5;
+
+/// FNV-1a 64: stable across processes (unlike `DefaultHasher`), so a helper
+/// restarting on the same data dir reuses its daemon dir.
+fn fnv1a64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn fits(dir: &Path) -> bool {
+    dir.to_string_lossy().len() + SESSION_BUDGET <= MAX_SOCK_PATH
+}
+
+pub fn socket_dir(data_dir: &Path) -> PathBuf {
+    let primary = data_dir.join("ab");
+    if fits(&primary) {
+        return primary;
+    }
+    let hash = format!("hoo-{:016x}", fnv1a64(&data_dir.to_string_lossy()));
+    let fallback = std::env::temp_dir().join(&hash);
+    if fits(&fallback) {
+        return fallback;
+    }
+    // Unix-only helper: /tmp always exists and is short.
+    PathBuf::from("/tmp").join(hash)
+}
+
 /// A launched Chromium: the child plus its DevTools endpoint.
 pub struct Chromium {
     /// Owned by the helper after `set_chromium`; killed on shutdown.
@@ -287,6 +327,22 @@ mod tests {
             Some("ws://127.0.0.1:54321/devtools/browser/abc")
         );
         assert_eq!(parse_devtools_line("noise"), None);
+    }
+
+    #[test]
+    fn socket_dir_falls_back_to_a_short_hash() {
+        let short = Path::new("/tmp/hoo");
+        assert_eq!(socket_dir(short), short.join("ab"));
+        let long =
+            Path::new("/var/folders/rf/1zmzg09n0w99lgrmhyn_nv3r0000gn/T/hoo-browser-it-real-8360");
+        let fallback = socket_dir(long);
+        assert!(
+            fits(&fallback),
+            "fallback still too long: {}",
+            fallback.display()
+        );
+        // Stable: the same data dir maps to the same daemon dir.
+        assert_eq!(fallback, socket_dir(long));
     }
 
     #[test]

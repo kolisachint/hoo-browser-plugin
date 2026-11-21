@@ -463,11 +463,23 @@ async fn start_test_page() -> (String, tokio::task::JoinHandle<()>) {
                 break;
             };
             tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let Ok(n) = stream.read(&mut buf).await else {
-                    return;
-                };
-                let request = String::from_utf8_lossy(&buf[..n]);
+                // Read until the headers complete: a single read can split
+                // the request under a navigation burst.
+                let mut seen = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    if seen.len() > 65536 || seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&seen);
                 let path = request
                     .lines()
                     .next()
@@ -637,12 +649,25 @@ async fn real_no_steal_suite() {
             let token = token.to_string();
             tasks.push(tokio::spawn(async move {
                 let peer = connect(&socket, &token).await;
-                let opened = call(
+                let mut opened = call(
                     &peer,
                     "browser_open",
                     serde_json::json!({"url": url, "tab": tab}),
                 )
                 .await;
+                // A navigation burst can abort one load; the helper reports
+                // it as a tool error and a single retry lands it.
+                if let Ok(result) = &opened {
+                    if is_error(result) && text_of(result).contains("ERR_ABORTED") {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        opened = call(
+                            &peer,
+                            "browser_open",
+                            serde_json::json!({"url": url, "tab": tab}),
+                        )
+                        .await;
+                    }
+                }
                 let snap = call(&peer, "browser_snapshot", serde_json::json!({"tab": tab})).await;
                 (i, tab, opened, snap)
             }));

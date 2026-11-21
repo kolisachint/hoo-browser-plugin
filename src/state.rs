@@ -49,6 +49,11 @@ pub struct State {
 
 /// Agent ids may contain `/` (`root/task-1`); session names may not, so map
 /// every other character to `_` (same rule as hoocode's `echo_helper`).
+/// Capped at [`MAX_SANITIZED_ID`] characters: agent ids nest (`root/a/b/c`)
+/// and the socket path has an OS limit, so a long id truncates (the
+/// collision fallback in `ensure` still keeps sessions apart).
+pub const MAX_SANITIZED_ID: usize = 32;
+
 pub fn sanitize_agent_id(agent_id: &str) -> String {
     let out: String = agent_id
         .chars()
@@ -62,6 +67,8 @@ pub fn sanitize_agent_id(agent_id: &str) -> String {
         .collect();
     if out.is_empty() {
         "agent".to_owned()
+    } else if out.len() > MAX_SANITIZED_ID {
+        out[..MAX_SANITIZED_ID].to_owned()
     } else {
         out
     }
@@ -268,6 +275,15 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_ids_truncate_but_stay_valid() {
+        let long = sanitize_agent_id("root/task-1/leaf-node-with-a-very-long-name");
+        assert!(long.len() <= MAX_SANITIZED_ID);
+        assert!(long
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+    }
 
     #[test]
     fn sanitize_matches_session_name_rules() {

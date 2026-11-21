@@ -262,10 +262,19 @@ pub async fn run_command(
     })?
     .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
     if !output.status.success() {
+        // Failures can land on either stream: usage errors go to stderr,
+        // `--json` errors to stdout. Report both so nothing is lost.
+        let stderr = short_stderr(&String::from_utf8_lossy(&output.stderr));
+        let stdout = short_stderr(&String::from_utf8_lossy(&output.stdout));
+        let detail = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => format!("stderr: {stderr} | stdout: {stdout}"),
+            (false, true) => format!("stderr: {stderr}"),
+            (true, false) => format!("stdout: {stdout}"),
+            (true, true) => "(no output)".to_owned(),
+        };
         return Err(HooError::Failed(format!(
-            "agent-browser exited {}: {}",
-            output.status,
-            short_stderr(&String::from_utf8_lossy(&output.stderr))
+            "agent-browser exited {}: {detail}",
+            output.status
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
