@@ -16,6 +16,18 @@ use crate::error::{short_stderr, HooError};
 /// tool budget (M1). `browser_wait` is capped below this (see MAX_WAIT_MS).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Effective per-call timeout. `HOO_BROWSER_CALL_TIMEOUT_SECS` overrides it;
+/// that hook exists for the timeout test (a 45 s test would be absurd) and
+/// is never set in production.
+pub fn call_timeout() -> Duration {
+    std::env::var("HOO_BROWSER_CALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(CALL_TIMEOUT)
+}
+
 /// `browser_wait` ceiling in ms: the whole CLI run (spawn, connect, wait)
 /// must fit inside [`CALL_TIMEOUT`].
 pub const MAX_WAIT_MS: u64 = 40_000;

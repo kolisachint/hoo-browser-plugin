@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::error::HooError;
-use crate::exec::{self, ExecOutput, CALL_TIMEOUT};
+use crate::exec::{self, ExecOutput};
 use crate::state::{AgentRecord, State};
 
 /// The 8 declared tools (served by `tools/list` and in the manifest).
@@ -571,7 +571,7 @@ impl Helper {
                 None,
             )?;
             let child_started = std::time::Instant::now();
-            let data = exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await;
+            let data = exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await;
             (child_started.elapsed(), data.map(ExecOutput::Json))
         };
         let total = started.elapsed();
@@ -656,7 +656,7 @@ impl Helper {
     /// Give a fresh lease its own window on the shared browser.
     async fn open_window(&self, session: &str) -> Result<(), HooError> {
         let argv = self.session_argv(session, &["window", "new"]);
-        exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await?;
+        exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await?;
         Ok(())
     }
 
@@ -679,7 +679,7 @@ impl Helper {
             Err(e) => return (std::time::Duration::ZERO, Err(e)),
         };
         let child_started = std::time::Instant::now();
-        let result = exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await;
+        let result = exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await;
         let child = child_started.elapsed();
         let output = result.and_then(|_| {
             std::fs::read(&path).map(ExecOutput::Png).map_err(|e| {
@@ -705,12 +705,12 @@ impl Helper {
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         exec::child_env(&mut child, Some(&self.inner.sock_dir));
-        let output = tokio::time::timeout(CALL_TIMEOUT, child.output())
+        let output = tokio::time::timeout(exec::call_timeout(), child.output())
             .await
             .map_err(|_| {
                 HooError::Spawn(format!(
                     "agent-browser timed out after {}s",
-                    CALL_TIMEOUT.as_secs()
+                    exec::call_timeout().as_secs()
                 ))
             })?
             .map_err(|e| HooError::Spawn(format!("cannot spawn agent-browser: {e}")))?;
@@ -757,7 +757,8 @@ impl Helper {
                         None,
                     )?;
                     let call_started = std::time::Instant::now();
-                    let result = exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await;
+                    let result =
+                        exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await;
                     child += call_started.elapsed();
                     match result {
                         Ok(data) => tabs.push(
@@ -784,7 +785,8 @@ impl Helper {
                 // then `close`, whose failure the caller sees.
                 let tab_close = self.session_argv(&session, &["tab", "close"]);
                 let call_started = std::time::Instant::now();
-                let _ = exec::run_command(&tab_close, CALL_TIMEOUT, &self.inner.sock_dir).await;
+                let _ =
+                    exec::run_command(&tab_close, exec::call_timeout(), &self.inner.sock_dir).await;
                 child += call_started.elapsed();
                 let argv = exec::tool_argv(
                     &self.inner.agent_browser,
@@ -795,7 +797,7 @@ impl Helper {
                     None,
                 )?;
                 let call_started = std::time::Instant::now();
-                exec::run_command(&argv, CALL_TIMEOUT, &self.inner.sock_dir).await?;
+                exec::run_command(&argv, exec::call_timeout(), &self.inner.sock_dir).await?;
                 child += call_started.elapsed();
                 self.inner
                     .state
@@ -853,9 +855,9 @@ impl Helper {
     /// the shared browser untouched for the other leases.
     async fn close_session(&self, session: &str) {
         let tab_close = self.session_argv(session, &["tab", "close"]);
-        let _ = exec::run_command(&tab_close, CALL_TIMEOUT, &self.inner.sock_dir).await;
+        let _ = exec::run_command(&tab_close, exec::call_timeout(), &self.inner.sock_dir).await;
         let close = self.session_argv(session, &["close"]);
-        let _ = exec::run_command(&close, CALL_TIMEOUT, &self.inner.sock_dir).await;
+        let _ = exec::run_command(&close, exec::call_timeout(), &self.inner.sock_dir).await;
     }
 
     /// Close every lease (bounded concurrency) before killing Chromium (H3):
