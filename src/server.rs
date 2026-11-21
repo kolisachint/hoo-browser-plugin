@@ -509,11 +509,22 @@ impl Helper {
     /// new tab wait for the creator instead of opening duplicate windows.
     async fn acquire(
         &self,
-        agent_id: &str,
+        agent: &AgentRecord,
+        token: &str,
         tab: usize,
         deadline: std::time::Instant,
     ) -> Result<String, HooError> {
+        let agent_id = agent.agent_id.as_str();
         loop {
+            // N5: agentEnded may have removed the caller's token while a
+            // concurrent initializer worked. Re-check registration before
+            // (re)creating anything: a rolled-back lease (`None` below)
+            // must not come back for a dead agent.
+            if !self.inner.state.lock().await.tokens.contains_key(token) {
+                return Err(HooError::Refused(format!(
+                    "agent {agent_id} is no longer registered (agentEnded?)"
+                )));
+            }
             let (session, fresh) = self.inner.state.lock().await.ensure(agent_id, tab)?;
             // Touch at call start (M7): the sweeper skips anything touched
             // within the idle window, so a call in flight is never reaped.
@@ -564,11 +575,12 @@ impl Helper {
     async fn run_tool(
         &self,
         agent: &AgentRecord,
+        token: &str,
         tool: &str,
         args: &Value,
     ) -> Result<Vec<ContentBlock>, HooError> {
         if tool == "browser_cli" {
-            return self.run_cli(agent, args).await;
+            return self.run_cli(agent, token, args).await;
         }
         if tool == "browser_tabs" {
             return self.run_tabs(agent, args).await;
@@ -580,7 +592,7 @@ impl Helper {
         // the command share it instead of stacking timeouts.
         let deadline = started + exec::CALL_BUDGET;
         let tab = tab_of(args)?;
-        let session = self.acquire(&agent.agent_id, tab, deadline).await?;
+        let session = self.acquire(agent, token, tab, deadline).await?;
         let (child, output) = if tool == "browser_screenshot" {
             self.run_screenshot(&session, args, deadline).await
         } else {
@@ -633,6 +645,7 @@ impl Helper {
     async fn run_cli(
         &self,
         agent: &AgentRecord,
+        token: &str,
         args: &Value,
     ) -> Result<Vec<ContentBlock>, HooError> {
         let started = std::time::Instant::now();
@@ -649,7 +662,7 @@ impl Helper {
             })
             .collect::<Result<_, _>>()?;
         let deadline = started + exec::CALL_BUDGET;
-        let default_session = self.acquire(&agent.agent_id, 1, deadline).await?;
+        let default_session = self.acquire(agent, token, 1, deadline).await?;
         let owned = self.inner.state.lock().await.owned(&agent.agent_id);
         let scoped = exec::scope_cli_args(&raw, &self.inner.cdp, &default_session, &owned)?;
         let mut full = vec![self.inner.agent_browser.to_string_lossy().into_owned()];
@@ -1133,7 +1146,7 @@ impl ServerHandler for Helper {
             .as_ref()
             .map(|map| Value::Object(map.clone()))
             .unwrap_or(Value::Null);
-        match self.run_tool(&agent, name, &args).await {
+        match self.run_tool(&agent, &token, name, &args).await {
             Ok(blocks) => Ok(CallToolResult::success(blocks).into()),
             Err(HooError::Refused(message)) => Err(refused(&message)),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())]).into()),
@@ -1323,6 +1336,82 @@ mod tests {
         );
         // An unreachable browser never stalls the close (5 s cap, best effort).
         devtools_close_target("127.0.0.1:1", "TARGET-9").await;
+    }
+
+    #[tokio::test]
+    async fn acquire_refuses_an_ended_agent_instead_of_recreating() {
+        // N5: agentEnded removes the token and the leases. A concurrent
+        // initializer finishing under the waiter must not bring the lease
+        // back: the re-ensure re-checks the token first.
+        let dir = std::env::temp_dir().join(format!("hoo-acquire-ended-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let helper = Helper::new(
+            std::path::PathBuf::from("/nonexistent/agent-browser-for-tests"),
+            "ws://fake".into(),
+            dir.clone(),
+            crate::backend::socket_dir(&dir),
+            "root-token".into(),
+            "root".into(),
+        );
+        let sender = helper
+            .inner
+            .state
+            .lock()
+            .await
+            .tokens
+            .get("root-token")
+            .cloned()
+            .expect("root token");
+        helper
+            .inner
+            .state
+            .lock()
+            .await
+            .register_agent(
+                &sender,
+                "root/task-1".into(),
+                Some("root".into()),
+                1,
+                "child-token".into(),
+            )
+            .expect("register");
+        // A lease created before the end (still initializing, as if its
+        // `window new` were in flight) goes away with agentEnded.
+        let (session, _) = helper
+            .inner
+            .state
+            .lock()
+            .await
+            .ensure("root/task-1", 1)
+            .expect("ensure");
+        assert!(helper
+            .inner
+            .state
+            .lock()
+            .await
+            .is_initializing(&session)
+            .unwrap());
+        helper.inner.state.lock().await.remove_agent("root/task-1");
+        let agent = AgentRecord {
+            agent_id: "root/task-1".into(),
+            parent_id: Some("root".into()),
+            depth: 1,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(50);
+        let error = helper
+            .acquire(&agent, "child-token", 1, deadline)
+            .await
+            .expect_err("an ended agent must be refused");
+        assert!(
+            matches!(error, HooError::Refused(_)),
+            "ended acquire must be a refusal, got {error:?}"
+        );
+        assert!(
+            helper.inner.state.lock().await.leases.is_empty(),
+            "no lease may be recreated for a dead agent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
