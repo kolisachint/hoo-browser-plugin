@@ -99,7 +99,12 @@ impl State {
     }
 
     /// The registration rule (spec B2): only a known sender may register, and
-    /// only its own children (`parentId == sender.agentId`).
+    /// only its own children (`parentId == sender.agentId`). Hardened (C1):
+    /// the id must nest under the sender (`sender/child`, depth exactly one
+    /// deeper), the token must be fresh, and an id already known under another
+    /// token is refused (re-registering your own token is idempotent).
+    /// Without this any agent could mint `root` (or a sibling's id) and
+    /// inherit its leases.
     pub fn register_agent(
         &mut self,
         sender: &AgentRecord,
@@ -117,6 +122,38 @@ impl State {
             return Err(HooError::Refused(format!(
                 "agentStarted refused: {} is not a child of {}",
                 agent_id, sender.agent_id
+            )));
+        }
+        let nested = format!("{}/", sender.agent_id);
+        if !agent_id.starts_with(&nested) {
+            return Err(HooError::Refused(format!(
+                "agentStarted refused: {agent_id} does not nest under {}",
+                sender.agent_id
+            )));
+        }
+        if depth != sender.depth + 1 {
+            return Err(HooError::Refused(format!(
+                "agentStarted refused: depth {depth} is not {} + 1",
+                sender.depth
+            )));
+        }
+        if let Some(known) = self.tokens.get(&token) {
+            // Re-registering your own token is idempotent (hoocode may
+            // replay agentStarted); the same token for another id is refused.
+            if known.agent_id != agent_id {
+                return Err(HooError::Refused(
+                    "agentStarted refused: token is already known for another agent".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if self
+            .tokens
+            .values()
+            .any(|record| record.agent_id == agent_id)
+        {
+            return Err(HooError::Refused(format!(
+                "agentStarted refused: {agent_id} is already registered under another token"
             )));
         }
         self.tokens.insert(
@@ -349,6 +386,101 @@ mod tests {
             )
             .expect("grandchild registers");
         assert!(state.tokens.contains_key("leaf-token"));
+    }
+
+    #[test]
+    fn registration_is_scoped_to_the_sender() {
+        let mut state = root_state();
+        let sender = state.tokens["root-token"].clone();
+        let register = |state: &mut State,
+                        sender: &AgentRecord,
+                        agent_id: &str,
+                        parent: Option<&str>,
+                        depth: u64,
+                        token: &str| {
+            state.register_agent(
+                sender,
+                agent_id.into(),
+                parent.map(str::to_owned),
+                depth,
+                token.into(),
+            )
+        };
+        register(
+            &mut state,
+            &sender,
+            "root/task-1",
+            Some("root"),
+            1,
+            "child-1",
+        )
+        .unwrap();
+        // Becoming root, a sibling, yourself, or an outsider is refused.
+        for (agent_id, depth) in [
+            ("root", 1),
+            ("root/task-1", 1),
+            ("root", 0),
+            ("other/task-9", 1),
+            ("root2/task-9", 1),
+        ] {
+            assert!(
+                register(&mut state, &sender, agent_id, Some("root"), depth, "fresh").is_err(),
+                "{agent_id} must be refused"
+            );
+        }
+        // The depth must be exactly one deeper.
+        assert!(register(&mut state, &sender, "root/task-2", Some("root"), 2, "t2").is_err());
+        assert!(register(&mut state, &sender, "root/task-2", Some("root"), 0, "t2").is_err());
+        // A token never registers twice.
+        assert!(register(
+            &mut state,
+            &sender,
+            "root/task-2",
+            Some("root"),
+            1,
+            "child-1"
+        )
+        .is_err());
+        // An id never registers under a second token …
+        assert!(register(
+            &mut state,
+            &sender,
+            "root/task-1",
+            Some("root"),
+            1,
+            "second"
+        )
+        .is_err());
+        // … but re-registering your own token is idempotent.
+        register(
+            &mut state,
+            &sender,
+            "root/task-1",
+            Some("root"),
+            1,
+            "child-1",
+        )
+        .expect("same token is idempotent");
+        // A grandchild nests under its own parent only.
+        let child = state.tokens["child-1"].clone();
+        assert!(register(
+            &mut state,
+            &child,
+            "root/task-2",
+            Some("root/task-1"),
+            2,
+            "grand"
+        )
+        .is_err());
+        register(
+            &mut state,
+            &child,
+            "root/task-1/leaf",
+            Some("root/task-1"),
+            2,
+            "grand",
+        )
+        .expect("nested grandchild registers");
     }
 
     #[test]
