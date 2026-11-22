@@ -45,9 +45,11 @@ p95; the real integration suite prints p50/p95.
 work; `chrome` (real Chrome via the 144+ toggle) and `lightpanda` return
 "not yet supported" (B4). Chromium resolves from `HOO_BROWSER_CHROME`, else
 agent-browser's own install, else common paths. agent-browser resolves from
-`HOO_BROWSER_AGENT_BROWSER` (use this for a local fork build with AB-1..AB-4
-until the first fork release), else the pinned data-dir file, else `PATH`;
-the pinned download stays unwired until that release (TODO in `backend.rs`).
+`HOO_BROWSER_AGENT_BROWSER` (use this for a local fork build; it overrides
+the pin), else the pinned download for the current platform
+(`v0.43.0-hoo.1`, verified by sha256 into
+`<data dir>/agent-browser/<tag>/agent-browser`), else `PATH` — but only on
+platforms with no pin.
 
 Chromium runs in its own process group so shutdown kills the whole tree;
 the DevTools port is `--remote-debugging-port=0` (a loopback-only,

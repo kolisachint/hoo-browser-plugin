@@ -140,7 +140,8 @@ async fn run() -> Result<(), HooError> {
 
     let backend_kind = backend::Backend::from_env();
     backend_kind.check_supported()?;
-    let agent_browser = backend::locate_agent_browser(&data_dir)?;
+    // Downloads the pinned fork asset on first need (verified, then reused).
+    let agent_browser = backend::ensure_agent_browser(&data_dir).await?;
     let chrome = backend::locate_chromium()?;
     let headed = backend_kind == backend::Backend::ChromiumHeaded;
 

@@ -36,7 +36,8 @@ in `value` (`Enter`, `Escape`) and falls back to `ref`.
 - Isolation: with the fork agent-browser the helper runs scoped (listings
   show your tabs, closes remove all of them); with upstream it runs safe
   (only your own bound tab, ever — other agents' tabs and URLs stay
-  hidden, and `cli tab list` is refused).
+  hidden, and `cli tab list` is refused). The helper downloads the pinned
+  fork build itself; `HOO_BROWSER_AGENT_BROWSER` overrides it.
 
 ## Waiting and reading
 
