@@ -1,6 +1,6 @@
 [package]
 name = "hoo-browser"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "Tier C native helper: one shared Chromium driven via the agent-browser CLI, scoped per-agent leases over MCP Streamable HTTP"
 license = "MIT"
