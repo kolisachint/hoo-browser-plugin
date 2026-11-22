@@ -25,8 +25,10 @@ in `value` (`Enter`, `Escape`) and falls back to `ref`.
 
 ## Tabs
 
-- `tab` is 1-based. `tab: 2` opens a second tab (a new session with its own
-  window); asking for tab 3 while you own 1 is an error — open tab 2 first.
+- `tab` is 1-based (1-4). `browser_open` with any free `tab` opens that
+  slot directly — no need to fill lower slots first (opening tab 3 while
+  you own only tab 1 just works). Other tools on a slot that is not open
+  error with a hint to open it with `browser_open` first.
 - Limits: 4 tabs per agent, 24 per session, 10 minutes idle (idle tabs close).
 - **`browser_tabs {action: "list"}`** shows your tabs; `{action: "close",
   tab}` closes one. Root only: `{action: "adopt", from}` takes another

@@ -253,7 +253,7 @@ async fn fake_leases_limits_and_names() {
     let (_helper, socket) =
         start_helper(&manifest_dir().join("tests/fake-agent-browser.sh"), &dir).await;
     let peer = connect(&socket, ROOT_TOKEN).await;
-    // Tabs open in order; tab 1 is the default.
+    // Any free slot opens directly; tab 1 is the default.
     let open = call(
         &peer,
         "browser_open",
@@ -285,7 +285,7 @@ async fn fake_leases_limits_and_names() {
         "tab 5 must be refused, got: {}",
         text_of(&over)
     );
-    // Skipping a tab number is refused too.
+    // A never-opened slot errors with the open-it hint.
     let skip = call(&peer, "browser_snapshot", serde_json::json!({"tab": 9}))
         .await
         .expect("protocol ok");
@@ -309,6 +309,44 @@ async fn fake_leases_limits_and_names() {
     .expect("protocol ok");
     assert!(is_error(&bad));
     assert!(text_of(&bad).contains("Unknown ref"));
+}
+
+#[tokio::test]
+async fn fake_open_any_free_slot_and_hint_on_free_slots() {
+    // Any free slot opens directly: `browser_open` with tab 3 first works
+    // (no need to fill lower slots), and other tools on a free slot
+    // error with a hint to open it via `browser_open`.
+    let dir = test_tmp("anyslot");
+    let (_helper, socket) =
+        start_helper(&manifest_dir().join("tests/fake-agent-browser.sh"), &dir).await;
+    let peer = connect(&socket, ROOT_TOKEN).await;
+    let third = call(
+        &peer,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/", "tab": 3}),
+    )
+    .await
+    .expect("open tab 3");
+    assert!(
+        !is_error(&third),
+        "tab 3 must open first: {}",
+        text_of(&third)
+    );
+    for tab in [1, 2, 4] {
+        let snap = call(&peer, "browser_snapshot", serde_json::json!({"tab": tab}))
+            .await
+            .expect("protocol ok");
+        assert!(is_error(&snap), "tab {tab} is still free");
+        let text = text_of(&snap);
+        assert!(
+            text.contains(&format!("tab {tab} is not open")) && text.contains("browser_open"),
+            "free slots hint at browser_open, got: {text}"
+        );
+    }
+    let snap = call(&peer, "browser_snapshot", serde_json::json!({"tab": 3}))
+        .await
+        .expect("snapshot tab 3");
+    assert!(!is_error(&snap), "tab 3 works: {}", text_of(&snap));
 }
 
 #[tokio::test]
@@ -386,6 +424,8 @@ async fn fake_parallel_agents_cross_agent_refused_and_lifecycle() {
     let child2 = connect(&socket, "child-2-token").await;
 
     // Two agents in parallel, two tabs each (leases: child-1 gets *-1, *-2).
+    // Only `browser_open` creates tabs: each agent opens its slots, then
+    // snapshots them.
     let (r1, r2) = tokio::join!(
         call(
             &child1,
@@ -400,6 +440,20 @@ async fn fake_parallel_agents_cross_agent_refused_and_lifecycle() {
     );
     assert!(!is_error(&r1.expect("child1 tab1")));
     assert!(!is_error(&r2.expect("child2 tab1")));
+    let (r1, r2) = tokio::join!(
+        call(
+            &child1,
+            "browser_open",
+            serde_json::json!({"url": "https://a.example/", "tab": 2})
+        ),
+        call(
+            &child2,
+            "browser_open",
+            serde_json::json!({"url": "https://b.example/", "tab": 2})
+        ),
+    );
+    assert!(!is_error(&r1.expect("child1 open tab2")));
+    assert!(!is_error(&r2.expect("child2 open tab2")));
     let (r1, r2) = tokio::join!(
         call(&child1, "browser_snapshot", serde_json::json!({"tab": 2})),
         call(&child2, "browser_snapshot", serde_json::json!({"tab": 2})),
@@ -1507,6 +1561,16 @@ async fn fake_registration_scoping_and_ending_rules() {
         .await
         .expect("root survives sibling ends");
     assert!(!is_error(&root_list));
+    // Only `browser_open` creates tabs: the child opens its slot, then
+    // other tools resolve it.
+    let child_open = call(
+        &child,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("protocol ok");
+    assert!(!is_error(&child_open));
     let child_snap = call(&child, "browser_snapshot", serde_json::json!({}))
         .await
         .expect("child survives self end");

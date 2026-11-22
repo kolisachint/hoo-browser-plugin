@@ -37,7 +37,7 @@
         "tools": [
           {
             "name": "browser_open",
-            "description": "Open a URL in the caller's tab (agent-browser `open`).",
+            "description": "Open a URL in the caller's tab (agent-browser `open`); any free slot 1-4 opens directly.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -46,7 +46,7 @@
                 },
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 }
               },
               "required": [
@@ -63,7 +63,7 @@
               "properties": {
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 },
                 "interactive": {
                   "type": "boolean",
@@ -102,7 +102,7 @@
                 },
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 }
               },
               "required": [
@@ -120,7 +120,7 @@
               "properties": {
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 },
                 "full_page": {
                   "type": "boolean",
@@ -147,7 +147,7 @@
                 },
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 },
                 "from": {
                   "type": "string",
@@ -168,7 +168,7 @@
               "properties": {
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 },
                 "ms": {
                   "type": "integer",
@@ -207,7 +207,7 @@
                 },
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 }
               },
               "required": [
@@ -227,7 +227,7 @@
                 },
                 "tab": {
                   "type": "integer",
-                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                  "description": "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open."
                 }
               },
               "required": [
