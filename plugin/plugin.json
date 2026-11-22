@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "hoo-browser",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Browser automation for hoocode: one shared Chromium driven via the agent-browser CLI, one tab lease per agent over a tier C helper.",
   "license": "MIT",
   "repository": "https://github.com/kolisachint/hoo-browser-plugin",
@@ -18,20 +18,20 @@
         "shared": true,
         "binaries": {
           "linux-x86_64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-linux-x86_64",
-            "sha256": "e77be6e0efc9f2bb67af46540ce2796943b19a7b86173083be7654bcd6505f97"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.9/hoo-browser-linux-x86_64",
+            "sha256": "4e6fa8edcab9a03aae75ae184374c2e9a6a58f101a101c056c2648721a66a211"
           },
           "linux-aarch64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-linux-aarch64",
-            "sha256": "c9445ad6bfd6758728ba795368e249f1bd56141d1ae99371541075334d506561"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.9/hoo-browser-linux-aarch64",
+            "sha256": "9450a184d73c01507dc1c728413a06ac64b76fa436025e2fbe9c69c4bb6f2eb0"
           },
           "darwin-aarch64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-darwin-aarch64",
-            "sha256": "92d3c49d5e43bddffc8122ff853263af0d22c69b3661af8d33191d32479222fc"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.9/hoo-browser-darwin-aarch64",
+            "sha256": "a65b8c55f4c2923a531a1cefa70bd44e11c126346e9118780d7164aa86128755"
           },
           "darwin-x86_64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-darwin-x86_64",
-            "sha256": "27a3ab4e48b091bc4babe7699ccf86a4ccd049ce957e26ed0973cb3a38efd8d8"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.9/hoo-browser-darwin-x86_64",
+            "sha256": "b0bb81000a18bda65d43bad0426716a147dec6be4b2c1737c531098d5faa167f"
           }
         },
         "tools": [
