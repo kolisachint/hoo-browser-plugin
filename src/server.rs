@@ -177,16 +177,23 @@ impl Helper {
 
     /// Fast shutdown for sessionEnding, parent death and signals (N1):
     /// kill the browser tree FIRST, then close leases with a hard ~1 s
-    /// cap, then reap, then remove the socket. hoocode waits ~2 s for us
-    /// to exit; the 60 s close_all could strand us past it. With the
-    /// browser already dead, the lease closes fail fast instead of hanging
-    /// on a wedged daemon.
+    /// cap, then stop the agent-browser daemons, then reap, then remove
+    /// the socket. hoocode waits ~2 s for us to exit; the 60 s close_all
+    /// could strand us past it. With the browser already dead, the lease
+    /// closes fail fast instead of hanging on a wedged daemon. The daemon
+    /// stop runs after the closes (they drive the CLI, which would respawn
+    /// a dead daemon) and stays far under the remaining budget (~300 ms).
     pub async fn shutdown_fast(&self) {
         if let Some(child) = self.inner.chromium.lock().await.as_ref() {
             kill_tree(child);
         }
         self.close_all_capped(std::time::Duration::from_secs(1))
             .await;
+        // Daemons attached via --cdp never idle-exit while attached, so a
+        // bare lease close only disconnects them: without this they survive
+        // with PPID 1 after we exit (their socket dir is the per-session
+        // runtime dir hoocode removes).
+        self.stop_daemons().await;
         self.shutdown().await;
         if let Some(path) = self.inner.socket_path.lock().await.clone() {
             let _ = std::fs::remove_file(&path);
@@ -1410,12 +1417,13 @@ fn pid_command(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Blocking half of `Helper::stop_daemons`: SIGTERM every live
-/// agent-browser daemon listed in the socket dir, then SIGKILL the
-/// stragglers. A pid is only signalled when its command still names the
-/// agent-browser binary, so a recycled pid is never touched.
+/// Blocking half of `Helper::stop_daemons`, also run once at helper
+/// startup for stale pid files before the socket dir is recreated: SIGTERM
+/// every live agent-browser daemon listed in the socket dir, then SIGKILL
+/// the stragglers after ~300 ms. A pid is only signalled when its command
+/// still names the agent-browser binary, so a recycled pid is never touched.
 #[cfg(unix)]
-fn stop_daemons_blocking(agent_browser: &std::path::Path, sock_dir: &std::path::Path) {
+pub fn stop_daemons_blocking(agent_browser: &std::path::Path, sock_dir: &std::path::Path) {
     let binary = agent_browser.to_string_lossy();
     let short = agent_browser
         .file_name()
@@ -1450,7 +1458,10 @@ fn stop_daemons_blocking(agent_browser: &std::path::Path, sock_dir: &std::path::
             let _ = libc::kill(*pid as libc::pid_t, libc::SIGTERM);
         }
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // ~300 ms, then SIGKILL: shutdown_fast runs us after the ~1 s lease
+    // close cap inside hoocode's ~2 s wait, so waiting longer here would
+    // blow the budget and strand the helper past session end.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
     for pid in &pids {
         while pid_alive(*pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));

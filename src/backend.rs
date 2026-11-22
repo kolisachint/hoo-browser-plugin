@@ -96,6 +96,38 @@ pub async fn probe_ab_scoped(agent_browser: &Path) -> bool {
     probe_ab_scoped_with(agent_browser, ab_scoped_from_env()).await
 }
 
+/// The version number from `agent-browser --version` (`0.43.0-hoo.1`),
+/// `None` when the binary will not answer. Used for the one startup log
+/// line; anything unparsable (missing binary, timeout, odd output) is
+/// `None`, never an error.
+pub async fn agent_browser_version(agent_browser: &Path) -> Option<String> {
+    let output = tokio::process::Command::new(agent_browser)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(10), output)
+        .await
+        .ok()?;
+    let output = output.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let version = line
+        .trim()
+        .strip_prefix("agent-browser")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| line.trim());
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_owned())
+    }
+}
+
 /// `probe_ab_scoped` with the override passed explicitly, so tests can
 /// exercise both branches without touching process-global env (parallel
 /// tests share it: `set_var` here would leak into other tests' helpers).
