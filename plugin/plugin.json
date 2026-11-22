@@ -1,11 +1,16 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "hoo-browser",
-  "version": "0.1.0",
+  "version": "0.1.8",
   "description": "Browser automation for hoocode: one shared Chromium driven via the agent-browser CLI, one tab lease per agent over a tier C helper.",
   "license": "MIT",
   "repository": "https://github.com/kolisachint/hoo-browser-plugin",
-  "keywords": ["browser", "automation", "chromium", "agent-browser"],
+  "keywords": [
+    "browser",
+    "automation",
+    "chromium",
+    "agent-browser"
+  ],
   "extensions": {
     "dev.hoocode": {
       "native": {
@@ -13,20 +18,20 @@
         "shared": true,
         "binaries": {
           "linux-x86_64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-linux-x86_64",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-linux-x86_64",
+            "sha256": "e77be6e0efc9f2bb67af46540ce2796943b19a7b86173083be7654bcd6505f97"
           },
           "linux-aarch64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-linux-aarch64",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-linux-aarch64",
+            "sha256": "c9445ad6bfd6758728ba795368e249f1bd56141d1ae99371541075334d506561"
           },
           "darwin-aarch64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-darwin-aarch64",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-darwin-aarch64",
+            "sha256": "92d3c49d5e43bddffc8122ff853263af0d22c69b3661af8d33191d32479222fc"
           },
           "darwin-x86_64": {
-            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.0/hoo-browser-darwin-x86_64",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "url": "https://github.com/kolisachint/hoo-browser-plugin/releases/download/v0.1.8/hoo-browser-darwin-x86_64",
+            "sha256": "27a3ab4e48b091bc4babe7699ccf86a4ccd049ce957e26ed0973cb3a38efd8d8"
           }
         },
         "tools": [
@@ -36,10 +41,17 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "url": { "type": "string" },
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+                "url": {
+                  "type": "string"
+                },
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                }
               },
-              "required": ["url"]
+              "required": [
+                "url"
+              ]
             },
             "permission": "read"
           },
@@ -49,8 +61,14 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
-                "interactive": { "type": "boolean", "description": "Cursor position and interactive-only refs." }
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                },
+                "interactive": {
+                  "type": "boolean",
+                  "description": "Cursor position and interactive-only refs."
+                }
               },
               "required": []
             },
@@ -62,12 +80,35 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "action": { "type": "string", "enum": ["click", "fill", "select", "check", "uncheck", "hover", "press"] },
-                "ref": { "type": "string", "description": "Ref from the snapshot (e.g. \"e3\")." },
-                "value": { "type": "string", "description": "Text for fill, option for select, key for press." },
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "click",
+                    "fill",
+                    "select",
+                    "check",
+                    "uncheck",
+                    "hover",
+                    "press"
+                  ]
+                },
+                "ref": {
+                  "type": "string",
+                  "description": "Ref from the snapshot (e.g. \"e3\")."
+                },
+                "value": {
+                  "type": "string",
+                  "description": "Text for fill, option for select, key for press."
+                },
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                }
               },
-              "required": ["action", "ref"]
+              "required": [
+                "action",
+                "ref"
+              ]
             },
             "permission": "act"
           },
@@ -77,8 +118,14 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
-                "full_page": { "type": "boolean", "description": "Capture the full page, not just the viewport." }
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                },
+                "full_page": {
+                  "type": "boolean",
+                  "description": "Capture the full page, not just the viewport."
+                }
               },
               "required": []
             },
@@ -90,11 +137,26 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "action": { "type": "string", "enum": ["list", "close", "adopt"] },
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
-                "from": { "type": "string", "description": "Agent id to adopt tabs from (adopt only, root only)." }
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "list",
+                    "close",
+                    "adopt"
+                  ]
+                },
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                },
+                "from": {
+                  "type": "string",
+                  "description": "Agent id to adopt tabs from (adopt only, root only)."
+                }
               },
-              "required": ["action"]
+              "required": [
+                "action"
+              ]
             },
             "permission": "act"
           },
@@ -104,11 +166,26 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." },
-                "ms": { "type": "integer", "description": "Milliseconds to wait." },
-                "text": { "type": "string", "description": "Text to wait for." },
-                "ref": { "type": "string", "description": "Ref to wait for (from the snapshot)." },
-                "load": { "type": "string", "description": "Load state to wait for (e.g. networkidle)." }
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                },
+                "ms": {
+                  "type": "integer",
+                  "description": "Milliseconds to wait."
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Text to wait for."
+                },
+                "ref": {
+                  "type": "string",
+                  "description": "Ref to wait for (from the snapshot)."
+                },
+                "load": {
+                  "type": "string",
+                  "description": "Load state to wait for (e.g. networkidle)."
+                }
               },
               "required": []
             },
@@ -120,10 +197,22 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "action": { "type": "string", "enum": ["back", "forward", "reload"] },
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "back",
+                    "forward",
+                    "reload"
+                  ]
+                },
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                }
               },
-              "required": ["action"]
+              "required": [
+                "action"
+              ]
             },
             "permission": "act"
           },
@@ -133,10 +222,17 @@
             "inputSchema": {
               "type": "object",
               "properties": {
-                "js": { "type": "string" },
-                "tab": { "type": "integer", "description": "Tab number, 1-based (default 1); a new number opens a tab." }
+                "js": {
+                  "type": "string"
+                },
+                "tab": {
+                  "type": "integer",
+                  "description": "Tab number, 1-based (default 1); a new number opens a tab."
+                }
               },
-              "required": ["js"]
+              "required": [
+                "js"
+              ]
             },
             "permission": "dangerous"
           }
