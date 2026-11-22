@@ -57,19 +57,38 @@ jobs:
             esac
           fi
 
+      # The base is the max of Cargo.toml and the latest v* tag: the old
+      # browsertools tags (v0.1.1..v0.1.7) predate the helper crate
+      # (Cargo.toml 0.1.0), so bumping Cargo.toml alone would reuse a tag
+      # and `git tag` would die with exit 128. The collision loop keeps a
+      # re-run or a queued run from ever reusing an existing tag.
       - name: compute next version
         id: bump
         if: steps.kind.outputs.type != 'none'
         run: |
-          CURRENT_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          echo "Current version: $CURRENT_VERSION"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "Cargo.toml version: $CARGO_VERSION"
+          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 | sed 's/^v//')
+          echo "Latest v* tag: ${LATEST_TAG:-none}"
+          BASE="$CARGO_VERSION"
+          if [ -n "${LATEST_TAG:-}" ] && \
+             [ "$(printf '%s\n%s\n' "$BASE" "$LATEST_TAG" | sort -V | tail -n1)" = "$LATEST_TAG" ]; then
+            BASE="$LATEST_TAG"
+          fi
+          echo "Base version: $BASE"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
           case "${{ steps.kind.outputs.type }}" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
           esac
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          while git rev-parse -q --verify "refs/tags/v$NEW_VERSION" >/dev/null; do
+            echo "v$NEW_VERSION is already tagged; advancing patch"
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          done
           echo "New version: $NEW_VERSION"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
@@ -142,8 +161,8 @@ jobs:
       - name: Configure Git
         run: |
           git checkout -B main origin/main
-          git config user.name "GitHub Actions"
-          git config user.email "github-actions@github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: bump Cargo.toml, Cargo.lock and plugin.json
         run: |
@@ -169,12 +188,23 @@ jobs:
       - name: pin release sha256s into plugin/plugin.json
         run: python3 scripts/update_manifest.py --version "${{ needs.version.outputs.version }}" --dir ./dist
 
+      # Commit, tag, push: main first, then the tag, so a failure never
+      # leaves a local-only commit behind. Every step is idempotent, so a
+      # re-run (or a queued second run) continues instead of erroring.
       - name: commit, tag and push
         run: |
           VERSION="${{ needs.version.outputs.version }}"
           git add Cargo.toml Cargo.lock plugin/plugin.json
-          git commit -m "release: v${VERSION}"
-          git tag -a "v${VERSION}" -m "release: v${VERSION}"
+          if git diff --cached --quiet; then
+            echo "version bump already on main; skipping commit"
+          else
+            git commit -m "release: v${VERSION}"
+          fi
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "tag v${VERSION} already exists; reusing it"
+          else
+            git tag -a "v${VERSION}" -m "release: v${VERSION}"
+          fi
           git push origin main
           git push origin "v${VERSION}"
 

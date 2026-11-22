@@ -837,7 +837,12 @@ mod tests {
         // A live sleeper whose command line names our profile: stale ours.
         // (`exec -a` keeps the marker in argv: plain `sh -c 'sleep 60 #…'`
         // execs sleep and the comment never reaches the final argv.)
-        let mut sleeper = std::process::Command::new("sh")
+        // Bash, not `sh`: on Ubuntu `sh` is dash, which rejects `exec -a`
+        // and exits at once, leaving a zombie whose ps line no longer names
+        // the profile (reads as Foreign and falls back instead of being
+        // killed and taken). Both sides of the bash exec race name the
+        // profile: before, the `bash -c` line itself; after, argv[0].
+        let mut sleeper = std::process::Command::new("bash")
             .args([
                 "-c",
                 &format!("exec -a stale-{} sleep 300", profile.display()),
