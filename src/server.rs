@@ -41,7 +41,7 @@ use crate::state::{AgentRecord, State};
 pub const DECLARED_TOOLS: &[(&str, &str)] = &[
     (
         "browser_open",
-        "Open a URL in the caller's tab (agent-browser `open`).",
+        "Open a URL in the caller's tab (agent-browser `open`); any free slot 1-4 opens directly.",
     ),
     (
         "browser_snapshot",
@@ -259,7 +259,7 @@ pub fn tool_schemas() -> Vec<(String, String, Value)> {
                     .into_iter()
                     .collect(),
             ),
-            "Tab number, 1-based (default 1); a new number opens a tab.",
+            "Tab number 1-4 (default 1); browser_open opens that slot when free, other tools need it open.",
         )
     }
     vec![
@@ -707,7 +707,25 @@ impl Helper {
         // while `child` covers only agent-browser spawns.
         let deadline = started + exec::CALL_BUDGET;
         let tab = tab_of(args)?;
-        let (session, window_new) = self.acquire(agent, token, tab, deadline).await?;
+        // Only `browser_open` creates tabs (any free slot 1-4 opens
+        // directly); every other tool resolves the slot and errors with
+        // the open-it hint when it is free.
+        let (session, window_new) = if tool == "browser_open" {
+            self.acquire(agent, token, tab, deadline).await?
+        } else {
+            let session = self
+                .inner
+                .state
+                .lock()
+                .await
+                .resolve(&agent.agent_id, tab)?;
+            let mut state = self.inner.state.lock().await;
+            state.touch(&session);
+            if state.is_closing(&session) {
+                return Err(HooError::Failed(format!("tab {tab} is closing; try again")));
+            }
+            (session, std::time::Duration::ZERO)
+        };
         let (child, output) = if tool == "browser_screenshot" {
             self.run_screenshot(&session, args, deadline).await
         } else {

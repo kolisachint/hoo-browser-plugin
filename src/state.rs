@@ -216,9 +216,16 @@ impl State {
     }
 
     /// Resolve tab N (1-based) for `agent_id` without creating anything.
+    /// A free slot (never opened, or closed) is an error with a hint:
+    /// only `browser_open` creates tabs, any free slot 1-4 directly.
     pub fn resolve(&self, agent_id: &str, tab: usize) -> Result<String, HooError> {
         if tab == 0 {
             return Err(HooError::Failed("tab numbers start at 1".into()));
+        }
+        if tab > MAX_TABS_PER_AGENT {
+            return Err(HooError::Failed(format!(
+                "tab {tab} is over the {MAX_TABS_PER_AGENT}-tab limit"
+            )));
         }
         self.order
             .get(agent_id)
@@ -226,18 +233,15 @@ impl State {
             .and_then(|slot| slot.clone())
             .ok_or_else(|| {
                 HooError::Failed(format!(
-                    "agent {agent_id} has no tab {tab} (it has {})",
-                    self.order
-                        .get(agent_id)
-                        .map(|slots| slots.iter().filter(|s| s.is_some()).count())
-                        .unwrap_or(0),
+                    "tab {tab} is not open; call browser_open with tab {tab}"
                 ))
             })
     }
 
-    /// Resolve tab N, creating the lease when N is exactly one past the end
-    /// (a new tab). Returns the session plus whether it is fresh (the caller
-    /// then runs `window new` so the lease gets its own window).
+    /// Resolve tab N, creating the lease when N is any free slot 1-4
+    /// (a new tab opens that slot directly, lower slots need not be
+    /// filled first). Returns the session plus whether it is fresh (the
+    /// caller then runs `window new` so the lease gets its own window).
     ///
     /// Takes the caller's token and checks it against the tokens map
     /// itself (B5), so the check and the mutation share one guard: a
@@ -261,6 +265,11 @@ impl State {
         if tab == 0 {
             return Err(HooError::Failed("tab numbers start at 1".into()));
         }
+        if tab > MAX_TABS_PER_AGENT {
+            return Err(HooError::Failed(format!(
+                "tab {tab} is over the {MAX_TABS_PER_AGENT}-tab limit"
+            )));
+        }
         let slots = self.order.get(agent_id).map(Vec::len).unwrap_or(0);
         if tab <= slots {
             if let Some(session) = self.order[agent_id][tab - 1].clone() {
@@ -268,12 +277,9 @@ impl State {
             }
             // A closed slot: fall through and reopen it with a fresh
             // session (the limits below still apply).
-        } else if tab > slots + 1 {
-            return Err(HooError::Failed(format!(
-                "agent {agent_id} has {slots} tab(s); open tab {} first",
-                slots + 1
-            )));
         }
+        // Any free slot opens directly: gaps stay `None` (fixed slots,
+        // never renumbered), so `browser_open` with tab 3 first works.
         let open = self
             .order
             .get(agent_id)
@@ -311,11 +317,10 @@ impl State {
             },
         );
         let slots = self.order.entry(agent_id.to_owned()).or_default();
-        if tab <= slots.len() {
-            slots[tab - 1] = Some(session.clone());
-        } else {
-            slots.push(Some(session.clone()));
+        while slots.len() < tab {
+            slots.push(None);
         }
+        slots[tab - 1] = Some(session.clone());
         Ok((session, true))
     }
 
@@ -653,11 +658,18 @@ mod tests {
         assert!(fresh && s1 == "root_task-1-1");
         let (s1b, fresh) = ensure(&mut state, "root/task-1", 1).unwrap();
         assert!(!fresh && s1b == s1);
-        // Skipping a tab is refused.
-        assert!(ensure(&mut state, "root/task-1", 3).is_err());
+        // Any free slot opens directly: tab 3 first works, lower slots
+        // stay free (fixed slots, never renumbered).
+        let (s3, fresh) = ensure(&mut state, "root/task-1", 3).unwrap();
+        assert!(fresh && s3 == "root_task-1-3");
+        // A free slot resolves with the open-it hint, never a bare count.
+        let hint = state.resolve("root/task-1", 2).unwrap_err().to_string();
+        assert!(
+            hint.contains("tab 2 is not open") && hint.contains("browser_open"),
+            "free slots hint at browser_open, got: {hint}"
+        );
         let (s2, fresh) = ensure(&mut state, "root/task-1", 2).unwrap();
         assert!(fresh && s2 == "root_task-1-2");
-        ensure(&mut state, "root/task-1", 3).unwrap();
         ensure(&mut state, "root/task-1", 4).unwrap();
         assert!(ensure(&mut state, "root/task-1", 5).is_err());
     }
