@@ -14,11 +14,12 @@ cargo build        # binary: target/debug/hoo-browser
 Needs Rust 1.100 (rust-toolchain pins it if present). No Chromium or
 agent-browser needed to build; both resolve at runtime:
 
-- agent-browser CLI: `HOO_BROWSER_AGENT_BROWSER` env, else the pinned file in
-  the data dir, else `PATH`. To use a local build (e.g. the fork with the
-  AB-1..AB-4 fixes before its first release), point `HOO_BROWSER_AGENT_BROWSER`
-  at the built binary — this is the supported route until the pinned fork
-  release exists (see `backend.rs`).
+- agent-browser CLI: `HOO_BROWSER_AGENT_BROWSER` env, else the helper
+  downloads the pinned fork build (`v0.43.0-hoo.1`) into
+  `<data dir>/agent-browser/v0.43.0-hoo.1/agent-browser`, verifies its
+  sha256 and reuses it, else `PATH` (only on platforms with no pin).
+  To use a local build, point `HOO_BROWSER_AGENT_BROWSER` at the built
+  binary — this overrides the pin (see `backend.rs`).
 - Two modes (see `DESIGN.md`): **scoped** when the agent-browser is the hoo
   fork (detected by `-hoo.` in `agent-browser --version`, e.g.
   `0.43.1-hoo.1`), **safe** with upstream agent-browser. Full isolation

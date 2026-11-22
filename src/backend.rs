@@ -118,51 +118,204 @@ pub async fn probe_ab_scoped_with(agent_browser: &Path, forced: Option<bool>) ->
             && version_is_scoped(&String::from_utf8_lossy(&output.stdout)))
 }
 
-/// Pinned agent-browser release (spec B3). The pin points at the fork
-/// (`kolisachint/agent-browser`); the fork has no release with AB-1..AB-4
-/// yet, so the download stays unwired and the helper reports exactly where
-/// to put the binary. That first fork release MUST carry a `-hoo.N`
-/// version (see `version_is_scoped`): without it the helper cannot tell
-/// the fork from upstream and stays in safe mode.
+/// Pinned agent-browser release (spec B3): the hoo fork
+/// (`kolisachint/agent-browser`). The helper downloads the pinned asset for
+/// the current platform on first need (helper start) into
+/// `<data dir>/agent-browser/<tag>/agent-browser`, verifies its sha256,
+/// and reuses it while the hash matches. `HOO_BROWSER_AGENT_BROWSER`
+/// overrides the pin (local fork builds); `PATH` stays the fallback only
+/// for platforms with no pin, which then run in safe mode (see DESIGN.md).
 ///
-/// TODO(B3): cut the first fork release, fill `sha256` below from its
-/// assets, wire the download. Until then use a local build via
-/// `HOO_BROWSER_AGENT_BROWSER` (see README).
-#[allow(dead_code)]
+/// The fork's releases MUST carry a `-hoo.N` version (see
+/// `version_is_scoped`): without it the helper cannot tell the fork from
+/// upstream and stays in safe mode.
 pub struct AgentBrowserPin {
     pub platform: &'static str,
     pub url: &'static str,
     pub sha256: &'static str,
 }
 
-/// TODO(B3): placeholder URLs until the first fork release exists.
-pub const AGENT_BROWSER_PIN_TAG: &str = "fork-first-release";
-#[allow(dead_code)]
+/// The fork release the helper downloads. `SHA256SUMS` from the release's
+/// assets, verified by hand before pinning.
+pub const AGENT_BROWSER_PIN_TAG: &str = "v0.43.0-hoo.1";
 pub const AGENT_BROWSER_PINS: &[AgentBrowserPin] = &[
     AgentBrowserPin {
         platform: "linux-x86_64",
-        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-linux-x86_64",
-        sha256: "TODO",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/v0.43.0-hoo.1/agent-browser-linux-x86_64",
+        sha256: "f6b8783cbe412e868c270b8380bee5c08e23e21301d0e6a0c9dd208190e06350",
     },
     AgentBrowserPin {
         platform: "linux-aarch64",
-        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-linux-aarch64",
-        sha256: "TODO",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/v0.43.0-hoo.1/agent-browser-linux-aarch64",
+        sha256: "f397f5f0c5019d1d48823d1b9c842a114085d51a8672f40cb58309a60ff131f3",
     },
     AgentBrowserPin {
         platform: "darwin-aarch64",
-        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-darwin-aarch64",
-        sha256: "TODO",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/v0.43.0-hoo.1/agent-browser-darwin-aarch64",
+        sha256: "3dfc08dfae737cbd61c6f28f07b7e74e274b0f237073ccafef47fee406c7288a",
     },
     AgentBrowserPin {
         platform: "darwin-x86_64",
-        url: "https://github.com/kolisachint/agent-browser/releases/download/TODO-first-fork-release/agent-browser-darwin-x86_64",
-        sha256: "TODO",
+        url: "https://github.com/kolisachint/agent-browser/releases/download/v0.43.0-hoo.1/agent-browser-darwin-x86_64",
+        sha256: "5065944658c1f44d3cf73f634c6d238c764395956ab6739b92118b3cc6e3dc5a",
     },
 ];
 
-/// Locate the agent-browser CLI: `HOO_BROWSER_AGENT_BROWSER` env, else the
-/// pinned file in the plugin data dir, else PATH (spec B2).
+/// The pin for this build's platform, or `None` where the fork publishes
+/// no asset (`platform` matches the release asset suffix).
+pub fn pin_for_current_platform() -> Option<&'static AgentBrowserPin> {
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-aarch64",
+        ("macos", "x86_64") => "darwin-x86_64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        _ => return None,
+    };
+    AGENT_BROWSER_PINS
+        .iter()
+        .find(|pin| pin.platform == platform)
+}
+
+/// Where the pinned binary lives:
+/// `<data dir>/agent-browser/<tag>/agent-browser` (spec B3).
+pub fn pinned_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("agent-browser")
+        .join(AGENT_BROWSER_PIN_TAG)
+        .join("agent-browser")
+}
+
+/// Lowercase hex sha256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// True when `path` is a file whose sha256 matches `expected`.
+fn file_matches_sha256(path: &Path, expected: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    sha256_hex(&bytes) == expected.to_ascii_lowercase()
+}
+
+/// Download `url` and check its sha256 against `expected` before returning
+/// the bytes: a network failure, a non-2xx status, or a hash mismatch is
+/// an error, never a file.
+async fn fetch_verified(url: &str, expected: &str) -> Result<Vec<u8>, HooError> {
+    // `Client::new` honors proxy env (`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`)
+    // by default, so the download works behind the same proxy as curl.
+    let response = reqwest::Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| {
+            HooError::NoAgentBrowser(format!(
+                "cannot download the pinned agent-browser from {url}: {e}; check the network/proxy or set HOO_BROWSER_AGENT_BROWSER to a local binary"
+            ))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(HooError::NoAgentBrowser(format!(
+            "cannot download the pinned agent-browser from {url}: HTTP {status}"
+        )));
+    }
+    let bytes = response.bytes().await.map_err(|e| {
+        HooError::NoAgentBrowser(format!(
+            "cannot download the pinned agent-browser from {url}: {e}"
+        ))
+    })?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected.to_ascii_lowercase() {
+        return Err(HooError::NoAgentBrowser(format!(
+            "pinned agent-browser from {url} failed sha256 verification: expected {expected}, got {actual}"
+        )));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Install `bytes` at `dest`: unique temp file in the same dir, chmod
+/// 0755, atomic rename. A concurrent helper installing the same verified
+/// bytes wins or loses identically — the content is pinned by the hash —
+/// so the file is never corrupt, only ever one whole verified binary.
+fn install_executable(dest: &Path, bytes: &[u8]) -> Result<(), HooError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let parent = dest.parent().ok_or_else(|| {
+        HooError::NoAgentBrowser(format!("pinned path {} has no parent", dest.display()))
+    })?;
+    ensure_dir_0700(parent)?;
+    // Unique per process attempt: concurrent helpers never share a temp.
+    let tmp = parent.join(format!(
+        ".agent-browser-{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let install = (|| {
+        std::fs::write(&tmp, bytes)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&tmp, dest)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if install.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    install.map_err(|e| {
+        HooError::NoAgentBrowser(format!(
+            "cannot install the pinned agent-browser at {}: {e}",
+            dest.display()
+        ))
+    })
+}
+
+/// Reuse `dest` while its hash matches; else download `url`, verify, and
+/// atomically install. A concurrent helper may install between our check
+/// and our rename: re-check after the download and take their winner
+/// instead of re-downloading.
+async fn ensure_verified(dest: &Path, url: &str, expected: &str) -> Result<(), HooError> {
+    if file_matches_sha256(dest, expected) {
+        return Ok(());
+    }
+    let bytes = fetch_verified(url, expected).await?;
+    if file_matches_sha256(dest, expected) {
+        return Ok(());
+    }
+    install_executable(dest, &bytes)
+}
+
+/// Resolve the agent-browser binary, downloading the pin on first need:
+/// `HOO_BROWSER_AGENT_BROWSER` env, else the verified pinned download for
+/// this platform, else — only on platforms with no pin — the legacy
+/// data-dir file or `PATH` (safe mode).
+pub async fn ensure_agent_browser(data_dir: &Path) -> Result<PathBuf, HooError> {
+    if let Ok(path) = std::env::var("HOO_BROWSER_AGENT_BROWSER") {
+        let path = PathBuf::from(&path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(HooError::NoAgentBrowser(format!(
+            "HOO_BROWSER_AGENT_BROWSER={} is not a file",
+            path.display()
+        )));
+    }
+    if let Some(pin) = pin_for_current_platform() {
+        let dest = pinned_path(data_dir);
+        ensure_verified(&dest, pin.url, pin.sha256).await?;
+        return Ok(dest);
+    }
+    locate_agent_browser(data_dir)
+}
+
+/// Locate the agent-browser CLI without downloading: `HOO_BROWSER_AGENT_BROWSER`
+/// env, else the pinned file in the plugin data dir (placed by
+/// `ensure_agent_browser`), else the legacy data-dir file, else — only for
+/// platforms with no pin — `PATH` (spec B2).
 pub fn locate_agent_browser(data_dir: &Path) -> Result<PathBuf, HooError> {
     if let Ok(path) = std::env::var("HOO_BROWSER_AGENT_BROWSER") {
         let path = PathBuf::from(&path);
@@ -174,17 +327,36 @@ pub fn locate_agent_browser(data_dir: &Path) -> Result<PathBuf, HooError> {
             path.display()
         )));
     }
-    let pinned = data_dir.join("agent-browser");
+    let pinned = pinned_path(data_dir);
     if pinned.is_file() {
         return Ok(pinned);
     }
-    if let Some(path) = which_on_path("agent-browser") {
-        return Ok(path);
+    let legacy = data_dir.join("agent-browser");
+    if legacy.is_file() {
+        return Ok(legacy);
     }
-    Err(HooError::NoAgentBrowser(format!(
-        "no agent-browser CLI found: set HOO_BROWSER_AGENT_BROWSER, put the pinned binary at {}, or add agent-browser to PATH (pin: {AGENT_BROWSER_PIN_TAG}, download not wired yet, see backend.rs)",
-        pinned.display()
-    )))
+    // PATH stays the fallback only for platforms with no pin: where a pin
+    // exists the binary must come from the verified download, never
+    // silently from wherever PATH happens to point.
+    if pin_for_current_platform().is_none() {
+        if let Some(path) = which_on_path("agent-browser") {
+            return Ok(path);
+        }
+    }
+    Err(HooError::NoAgentBrowser(match pin_for_current_platform() {
+        Some(pin) => format!(
+            "no agent-browser CLI found: the pinned {} for {} is not downloaded yet ({}); it downloads on helper start, or set HOO_BROWSER_AGENT_BROWSER to a local binary",
+            AGENT_BROWSER_PIN_TAG,
+            pin.platform,
+            pinned.display()
+        ),
+        None => format!(
+            "no agent-browser CLI found: set HOO_BROWSER_AGENT_BROWSER, put the binary at {}, or add agent-browser to PATH (no pinned build for {}/{})",
+            pinned.display(),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+    }))
 }
 
 fn which_on_path(name: &str) -> Option<PathBuf> {
@@ -875,5 +1047,235 @@ mod tests {
         assert!(Backend::ChromiumHeaded.check_supported().is_ok());
         assert!(Backend::RealChrome.check_supported().is_err());
         assert!(Backend::Lightpanda.check_supported().is_err());
+    }
+
+    #[test]
+    fn pin_table_covers_four_platforms_with_real_sha256() {
+        // The URLs and digests below were verified against the release's
+        // SHA256SUMS before pinning; the helper keys scoped mode on the
+        // `-hoo.` marker in `--version`.
+        assert_eq!(AGENT_BROWSER_PIN_TAG, "v0.43.0-hoo.1");
+        let mut platforms: Vec<&str> = AGENT_BROWSER_PINS.iter().map(|pin| pin.platform).collect();
+        platforms.sort_unstable();
+        assert_eq!(
+            platforms,
+            [
+                "darwin-aarch64",
+                "darwin-x86_64",
+                "linux-aarch64",
+                "linux-x86_64"
+            ]
+        );
+        for pin in AGENT_BROWSER_PINS {
+            assert!(pin.url.ends_with(pin.platform));
+            assert!(pin.url.contains(AGENT_BROWSER_PIN_TAG));
+            assert!(!pin.url.contains("TODO"), "pin URL still a placeholder");
+            assert_eq!(pin.sha256.len(), 64, "pin sha256 not a digest");
+            assert!(
+                pin.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "pin sha256 not hex"
+            );
+        }
+        assert!(version_is_scoped("agent-browser 0.43.0-hoo.1"));
+        assert!(!version_is_scoped("agent-browser 0.43.0"));
+    }
+
+    #[test]
+    fn pin_covers_this_machine() {
+        // CI runs ubuntu + macos; both arches are pinned. Unknown platforms
+        // get None and keep the PATH fallback (safe mode).
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64")
+            | ("macos", "x86_64")
+            | ("linux", "x86_64")
+            | ("linux", "aarch64") => {
+                let pin = pin_for_current_platform().expect("pin for this platform");
+                assert!(pin.url.ends_with(pin.platform));
+                assert_eq!(
+                    pinned_path(Path::new("/data")),
+                    Path::new("/data")
+                        .join("agent-browser")
+                        .join(AGENT_BROWSER_PIN_TAG)
+                        .join("agent-browser")
+                );
+            }
+            _ => assert!(pin_for_current_platform().is_none()),
+        }
+    }
+
+    /// Minimal local HTTP server for the download tests: serves `body` with
+    /// a `Content-Length` on every connection until aborted. Returns its
+    /// address and the server task; `hits` counts accepted connections.
+    async fn serve_bytes(
+        body: Vec<u8>,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut head = vec![0u8; 4096];
+                    let _ = socket.read(&mut head).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (addr, server)
+    }
+
+    fn hit_counter() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn hit_count(hits: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn download_verifies_reuses_and_replaces_stale() {
+        let body = b"fake-agent-browser-bytes".to_vec();
+        let sha = sha256_hex(&body);
+        let served = hit_counter();
+        let (addr, server) = serve_bytes(body.clone(), served.clone()).await;
+        let url = format!("http://{addr}/agent-browser-test");
+        let dir = std::env::temp_dir().join(format!("hoo-pin-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = dir.join("agent-browser");
+
+        ensure_verified(&dest, &url, &sha).await.expect("download");
+        assert_eq!(std::fs::read(&dest).expect("read install"), body);
+        assert_eq!(hit_count(&served), 1);
+        // Reuse: the hash matches, so no second download.
+        ensure_verified(&dest, &url, &sha).await.expect("reuse");
+        assert_eq!(hit_count(&served), 1);
+        // A stale file is replaced by the verified bytes.
+        std::fs::write(&dest, b"stale").expect("corrupt install");
+        ensure_verified(&dest, &url, &sha)
+            .await
+            .expect("replace stale");
+        assert_eq!(std::fs::read(&dest).expect("read replacement"), body);
+        assert_eq!(hit_count(&served), 2);
+        // Installed executable: 0755.
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&dest)
+                .expect("stat install")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn download_refuses_mismatch_and_leaves_no_file() {
+        let body = b"fake-agent-browser-bytes".to_vec();
+        let served = hit_counter();
+        let (addr, server) = serve_bytes(body, served.clone()).await;
+        let url = format!("http://{addr}/agent-browser-test");
+        let dir = std::env::temp_dir().join(format!("hoo-pin-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = dir.join("agent-browser");
+
+        let wrong = "0".repeat(64);
+        let error = ensure_verified(&dest, &url, &wrong)
+            .await
+            .expect_err("mismatch must fail");
+        assert!(error.to_string().contains("sha256 verification"), "{error}");
+        assert!(!dest.exists(), "refused download must leave no file");
+        // A stale file is never clobbered by bytes that fail verification.
+        std::fs::create_dir_all(&dir).expect("seed dir");
+        std::fs::write(&dest, b"stale").expect("seed stale");
+        ensure_verified(&dest, &url, &wrong)
+            .await
+            .expect_err("mismatch must fail over stale");
+        assert_eq!(std::fs::read(&dest).expect("stale intact"), b"stale");
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_downloads_converge_on_one_valid_file() {
+        let body = b"fake-agent-browser-bytes".to_vec();
+        let sha = sha256_hex(&body);
+        let served = hit_counter();
+        let (addr, server) = serve_bytes(body.clone(), served.clone()).await;
+        let url = format!("http://{addr}/agent-browser-test");
+        let dir = std::env::temp_dir().join(format!("hoo-pin-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = dir.join("agent-browser");
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (dest, url, sha) = (dest.clone(), url.clone(), sha.clone());
+            tasks.push(tokio::spawn(async move {
+                ensure_verified(&dest, &url, &sha).await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("task panicked")
+                .expect("concurrent ensure");
+        }
+        // Whoever won, the file is exactly the verified bytes.
+        assert!(file_matches_sha256(&dest, &sha));
+        assert_eq!(std::fs::read(&dest).expect("read winner"), body);
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real check: downloads the actual darwin-aarch64 asset and asserts
+    /// the `-hoo.` fork marker that scoped mode keys on. Gated on
+    /// `HOO_BROWSER_NET=1` (needs network) and on macOS/arm64 (the binary
+    /// must execute); without the gate it passes vacuously.
+    #[tokio::test]
+    async fn net_downloads_darwin_arm64_pin_and_reports_hoo_version() {
+        if std::env::var("HOO_BROWSER_NET").as_deref() != Ok("1") {
+            return;
+        }
+        if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
+            return;
+        }
+        let pin = AGENT_BROWSER_PINS
+            .iter()
+            .find(|pin| pin.platform == "darwin-aarch64")
+            .expect("darwin-aarch64 pin");
+        let dir = std::env::temp_dir().join(format!("hoo-pin-net-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("net test dir");
+        let dest = dir.join("agent-browser");
+        ensure_verified(&dest, pin.url, pin.sha256)
+            .await
+            .expect("download the pinned fork asset");
+        let output = tokio::process::Command::new(&dest)
+            .arg("--version")
+            .output()
+            .await
+            .expect("run the downloaded agent-browser");
+        assert!(output.status.success(), "{output:?}");
+        let version = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            version.contains("0.43.0-hoo.1"),
+            "unexpected --version: {version}"
+        );
+        assert!(version_is_scoped(&version));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

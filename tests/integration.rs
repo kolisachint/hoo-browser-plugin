@@ -1725,19 +1725,27 @@ async fn sigterm_shuts_down_fast_like_session_ending() {
 // Real backend: real agent-browser + headless Chromium, behind HOO_BROWSER_IT.
 // ---------------------------------------------------------------------------
 
-fn real_backend() -> Option<PathBuf> {
+async fn real_backend() -> Option<PathBuf> {
     if std::env::var("HOO_BROWSER_IT").as_deref() != Ok("1") {
         return None;
     }
-    let path = std::env::var("HOO_BROWSER_AGENT_BROWSER")
-        .map(PathBuf::from)
-        .expect("HOO_BROWSER_IT=1 needs HOO_BROWSER_AGENT_BROWSER pointing at a real agent-browser binary");
-    assert!(
-        path.is_file(),
-        "agent-browser binary missing: {}",
-        path.display()
-    );
-    Some(path)
+    // Explicit binary wins; otherwise the helper's own pinned download
+    // (spec B3), verified by hash, so the suite runs without the env var.
+    if let Ok(path) = std::env::var("HOO_BROWSER_AGENT_BROWSER") {
+        let path = PathBuf::from(&path);
+        assert!(
+            path.is_file(),
+            "agent-browser binary missing: {}",
+            path.display()
+        );
+        return Some(path);
+    }
+    let dir = test_tmp("real-pin");
+    Some(
+        hoo_browser::backend::ensure_agent_browser(&dir)
+            .await
+            .expect("download the pinned agent-browser"),
+    )
 }
 
 /// Tiny HTTP page server for the no-steal suite: `/` links to `/two` and has
@@ -1905,7 +1913,7 @@ async fn cdp_page_targets(endpoint: &str) -> usize {
 
 #[tokio::test]
 async fn real_no_steal_suite() {
-    let Some(agent_browser) = real_backend() else {
+    let Some(agent_browser) = real_backend().await else {
         println!("skipping real backend (HOO_BROWSER_IT=1 not set)");
         return;
     };
