@@ -125,9 +125,16 @@ async fn run() -> Result<(), HooError> {
         .ok_or_else(|| HooError::Usage("HOOCODE_HELPER_SOCKET has no parent dir".into()))?;
     let data_dir = data_dir(&runtime);
     backend::ensure_dir_0700(&data_dir)?;
+    let backend_kind = backend::Backend::from_env();
+    backend_kind.check_supported()?;
+    // Downloads the pinned fork asset on first need (verified, then reused).
+    let agent_browser = backend::ensure_agent_browser(&data_dir).await?;
     // The daemon dir is per session and cleaned at startup, so a crashed
-    // helper's sockets never shadow the new daemon (H3).
+    // helper's sockets never shadow the new daemon (H3). Kill stale
+    // daemons from the pid files FIRST: removing the dir first would orphan
+    // them with PPID 1 (they don't idle-exit while attached via --cdp).
     let sock_dir = backend::socket_dir(&runtime);
+    server::stop_daemons_blocking(&agent_browser, &sock_dir);
     let _ = std::fs::remove_dir_all(&sock_dir);
     backend::ensure_dir_0700(&sock_dir)?;
     // N6: the helper-owned agent-browser config lives here (0600,
@@ -138,10 +145,6 @@ async fn run() -> Result<(), HooError> {
         ))
     })?;
 
-    let backend_kind = backend::Backend::from_env();
-    backend_kind.check_supported()?;
-    // Downloads the pinned fork asset on first need (verified, then reused).
-    let agent_browser = backend::ensure_agent_browser(&data_dir).await?;
     let chrome = backend::locate_chromium()?;
     let headed = backend_kind == backend::Backend::ChromiumHeaded;
 
@@ -156,6 +159,27 @@ async fn run() -> Result<(), HooError> {
     // once at startup by probing the binary (`HOO_BROWSER_AB_SCOPED`
     // forces it for tests).
     let scoped = backend::probe_ab_scoped(&agent_browser).await;
+    // One startup line in the log file (not just stderr): binary version,
+    // path, and the isolation mode, so a leak report can name the build.
+    {
+        let version = backend::agent_browser_version(&agent_browser)
+            .await
+            .unwrap_or_else(|| "unknown".into());
+        let line = format!(
+            "hoo-browser: agent-browser {} at {}, mode {}\n",
+            version,
+            agent_browser.display(),
+            if scoped { "scoped" } else { "safe" },
+        );
+        if let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("hoo-browser.log"))
+        {
+            use std::io::Write as _;
+            let _ = log.write_all(line.as_bytes());
+        }
+    }
     let helper = server::Helper::new(
         agent_browser,
         chromium.endpoint.clone(),

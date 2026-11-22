@@ -541,6 +541,12 @@ fn fake_wrapper(
             sh_quote(once_dir)
         ));
     }
+    // The wrapper path is the binary path the helper knows; the inner
+    // script names the fake daemon after it (argv[0]), so the helper's
+    // shutdown command-line check accepts the fake daemon exactly like
+    // the real one. A plain `exec -a` here would not survive: the kernel
+    // drops argv[0] when re-execing a shebang script's interpreter.
+    script.push_str("export FAKE_AB_SELF=\"$0\"\n");
     script.push_str(&format!(
         "exec {} \"$@\"\n",
         sh_quote(&manifest_dir().join("tests/fake-agent-browser.sh"))
@@ -1013,7 +1019,7 @@ async fn fake_version_probe_detects_fork_and_upstream() {
     fn version_fake(dir: &Path, name: &str, version: &str) -> PathBuf {
         let path = dir.join(name);
         let script = format!(
-            "#!/bin/bash\nexport FAKE_VERSION={version}\nexec '{}' \"$@\"\n",
+            "#!/bin/bash\nexport FAKE_VERSION={version}\nexport FAKE_AB_SELF=\"$0\"\nexec '{}' \"$@\"\n",
             manifest_dir()
                 .join("tests/fake-agent-browser.sh")
                 .to_string_lossy()
@@ -1721,6 +1727,137 @@ async fn sigterm_shuts_down_fast_like_session_ending() {
     }
 }
 
+/// The fake daemon pid the fake agent-browser wrote for `session`
+/// (`<sock_dir>/<session>.pid`, like the real `<session>.pid`), waiting
+/// for it to appear: `window new` spawns the daemon before answering.
+async fn daemon_pid(dir: &Path, session: &str) -> u32 {
+    let pid_file = hoo_browser::backend::socket_dir(dir).join(format!("{session}.pid"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                if pid > 0 {
+                    return pid;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon pid file never appeared: {}",
+            pid_file.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The daemon must be reaped by the shutdown under test, not left running.
+async fn assert_daemon_dead(pid: u32, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if !pid_alive(pid) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: daemon {pid} still alive after shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait for a spawned helper child to exit (sessionEnding / signals stop
+/// it; the caller already delivered the trigger).
+async fn wait_helper_exit(
+    child: &mut tokio::process::Child,
+    what: &str,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: helper never exited"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The startup line names the agent-browser binary and the isolation mode.
+fn assert_startup_line(dir: &Path, mode: &str) {
+    let log = std::fs::read_to_string(dir.join("hoo-browser.log")).expect("hoo-browser.log");
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("hoo-browser: agent-browser ")
+                && line.contains(", mode ")
+                && line.ends_with(&format!(", mode {mode}"))),
+        "startup line with the mode missing, got:\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn fake_daemons_die_on_session_ending() {
+    // The live leak: after `hoocode -p` exited, an agent-browser daemon
+    // (PPID 1) was still running while the helper and Chromium were gone.
+    // sessionEnding must reap every daemon the helper started (pid files
+    // in the socket dir) instead of leaving them for the 10-minute idle.
+    let (mut child, socket, _argv, _closed, devtools, dir) =
+        spawn_mode_helper("daemon-session-ending", "1").await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    let opened = call(
+        &root,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    assert!(!is_error(&opened), "open failed: {}", text_of(&opened));
+    let pid = daemon_pid(&dir, "root-1").await;
+    assert!(
+        pid_alive(pid),
+        "fake daemon must be running before sessionEnding"
+    );
+    send_session_ending(&root).await;
+    let status = wait_helper_exit(&mut child, "sessionEnding").await;
+    assert!(status.success(), "helper must exit 0, got {status}");
+    assert_daemon_dead(pid, "sessionEnding").await;
+    assert_startup_line(&dir, "scoped");
+    devtools.abort();
+}
+
+#[tokio::test]
+async fn fake_daemons_die_on_sigterm() {
+    // Same leak through the signal path: SIGTERM must run the same fast
+    // shutdown (browser tree, capped lease closes, daemon reaps) and the
+    // startup line must name safe mode when the binary is upstream.
+    let (mut child, socket, _argv, _closed, devtools, dir) =
+        spawn_mode_helper("daemon-sigterm", "0").await;
+    let root = connect(&socket, ROOT_TOKEN).await;
+    let opened = call(
+        &root,
+        "browser_open",
+        serde_json::json!({"url": "https://x.example/"}),
+    )
+    .await
+    .expect("open");
+    assert!(!is_error(&opened), "open failed: {}", text_of(&opened));
+    let pid = daemon_pid(&dir, "root-1").await;
+    assert!(pid_alive(pid), "fake daemon must be running before SIGTERM");
+    // SAFETY: SIGTERM to our own test child.
+    unsafe {
+        libc::kill(
+            child.id().expect("helper pid") as libc::pid_t,
+            libc::SIGTERM,
+        );
+    }
+    let status = wait_helper_exit(&mut child, "SIGTERM").await;
+    assert!(status.success(), "helper must exit 0, got {status}");
+    assert_daemon_dead(pid, "SIGTERM").await;
+    assert_startup_line(&dir, "safe");
+    devtools.abort();
+}
+
 // ---------------------------------------------------------------------------
 // Real backend: real agent-browser + headless Chromium, behind HOO_BROWSER_IT.
 // ---------------------------------------------------------------------------
@@ -2302,6 +2439,15 @@ async fn assert_no_leftover_processes(dir: &Path, agent_browser: &Path) {
     assert!(
         chromes.is_empty(),
         "chromium processes remain after teardown: {chromes}"
+    );
+    // The daemon leak: no agent-browser process tied to this run's socket
+    // dir may survive shutdown (daemons don't idle-exit while attached via
+    // --cdp; their socket dir is the per-session runtime dir hoocode
+    // removes).
+    let with_sock_dir = running(&sock_dir.to_string_lossy());
+    assert!(
+        with_sock_dir.is_empty(),
+        "agent-browser processes with the helper's socket dir remain after shutdown: {with_sock_dir}"
     );
 }
 

@@ -56,7 +56,15 @@ the DevTools port is `--remote-debugging-port=0` (a loopback-only,
 unauthenticated endpoint — the helper passes it to its own children over the
 command line, never over the network). The agent-browser daemon dir lives in
 the per-session runtime dir (the helper socket's parent, 0700, removed by
-hoocode at session end; cleaned at startup). The browser profile is
+hoocode at session end; cleaned at startup). Daemons attached via --cdp
+never idle-exit while attached, so every shutdown path (sessionEnding,
+SIGTERM/SIGINT, parent death) SIGTERMs every daemon listed in the socket
+dir's `<session>.pid` files after the capped lease closes (SIGKILL after
+~300 ms, inside the 2 s budget), verifying each pid's command line names
+the helper's agent-browser binary; startup does the same for stale pid
+files before recreating the dir, and logs one line (`hoo-browser:
+agent-browser <version> at <path>, mode scoped|safe`) to hoo-browser.log.
+The browser profile is
 `PLUGIN_DATA/profile` behind a lock file; a second live helper falls back to
 a fresh profile in its runtime dir. Every lease carries `--pin-tab` so its
 background window never takes focus (upstream AB-1).

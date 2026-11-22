@@ -91,6 +91,28 @@ case "$cmd" in
             && grep -qxF "$session" "$FAKE_FAIL_FILE" 2>/dev/null; then
             fail '"window new failed (injected)"'
         else
+            # Like the real CLI, the first command for a session leaves a
+            # long-lived daemon behind: a detached sleeper whose pid goes
+            # to `<session>.pid` in AGENT_BROWSER_SOCKET_DIR (see
+            # agent-browser cli/src/session_files.rs `SessionFile::Pid`).
+            # It never exits on its own — only the helper's shutdown kills
+            # it — so the daemon-leak tests can prove shutdown reaps it.
+            # `exec -a` names it after the binary path the helper invoked
+            # (FAKE_AB_SELF, exported by the test's wrapper: this script's
+            # own $0 is the inner path after the shebang re-exec), so the
+            # helper's command-line check accepts it exactly like the real
+            # daemon. An existing live pid is reused (a `window new`
+            # retry must not double-spawn).
+            # Redirections first: the sleeper must not inherit the CLI's
+            # captured stdout pipe, or the helper's read would never end.
+            if [ -n "${AGENT_BROWSER_SOCKET_DIR:-}" ] && [ -n "$session" ]; then
+                pid_file="$AGENT_BROWSER_SOCKET_DIR/$session.pid"
+                if ! pid=$(cat "$pid_file" 2>/dev/null) \
+                    || ! kill -0 "$pid" 2>/dev/null; then
+                    exec -a "${FAKE_AB_SELF:-$0}" sleep 300 >/dev/null 2>&1 < /dev/null &
+                    printf '%s\n' "$!" > "$pid_file"
+                fi
+            fi
             case "$session" in
                 *slow*) sleep 30 ;;
             esac
